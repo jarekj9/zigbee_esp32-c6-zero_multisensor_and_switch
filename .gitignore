@@ -1,0 +1,78 @@
+# ESP-IDF specific
+build/
+sdkconfig
+sdkconfig.old
+dependencies.lock
+
+# VSCode specific
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/extensions.json
+
+# Prerequisites
+*.d
+
+# Object files
+*.o
+*.ko
+*.obj
+*.elf
+
+# Linker output
+*.ilk
+*.map
+*.exp
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lo
+
+# Shared objects
+*.dll
+*.so
+*.so.*
+*.dylib
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Executables
+*.exe
+*.out
+*.app
+*.i*86
+*.x86_64
+*.hex
+*.bin
+
+# ESP-IDF specific firmware files
+*.bin.flash_args
+*.bin.map
+*.bin.sha256
+*.bin.signed
+*.bootloader.bin
+*.bootloader.elf
+*.partitions.bin
+*.phy_init_data.bin
+
+# Project specific temporary files
+temp/
+tmp/
+
+# Log files
+*.log
+
+# Cache files
+.cache/
+
+# Backup files
+*.bak
+*~
+*.swp
+*.swo
