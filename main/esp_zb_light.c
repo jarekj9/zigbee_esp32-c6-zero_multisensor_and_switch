@@ -16,6 +16,7 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "driver/gpio.h"
 #include "ha/esp_zigbee_ha_standard.h"
 #include "esp_zb_light.h"
 
@@ -23,7 +24,89 @@
 #error Define ZB_ED_ROLE in idf.py menuconfig to compile light (End Device) source code.
 #endif
 
+#define BUTTON_GPIO GPIO_NUM_2
+#define BUTTON_DEBOUNCE_MS 500  // Aggressive debounce
+#define REJOIN_COOLDOWN_MS 5000  // 5 second cooldown
+
 static const char *TAG = "ESP_ZB_ON_OFF_LIGHT";
+static volatile uint32_t last_interrupt_time = 0;
+
+static void IRAM_ATTR button_isr_handler(void* arg)
+{
+    uint32_t now = xTaskGetTickCountFromISR();
+    
+    // Debounce in ISR - ignore if less than 500ms since last interrupt
+    if ((now - last_interrupt_time) > pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS)) {
+        last_interrupt_time = now;
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        xTaskNotifyFromISR((TaskHandle_t)arg, 0, eNoAction, &xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
+}
+
+static void button_task(void *pvParameter)
+{
+    static TickType_t last_rejoin_time = 0;
+    
+    while(1) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        
+        // Measure how long button is held
+        TickType_t press_start = xTaskGetTickCount();
+        vTaskDelay(pdMS_TO_TICKS(100)); // Initial debounce
+        
+        // Wait while button is pressed and count time
+        while(gpio_get_level(BUTTON_GPIO) == 1) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        
+        TickType_t press_duration = xTaskGetTickCount() - press_start;
+        uint32_t press_ms = pdTICKS_TO_MS(press_duration);
+        
+        if(press_ms >= 5000) {
+            // Long press - Factory reset
+            ESP_LOGW(TAG, "Factory reset triggered - erasing network data");
+            
+            // Blink 3 times rapidly to indicate factory reset
+            for(int i = 0; i < 3; i++) {
+                light_driver_set_power(true);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                light_driver_set_power(false);
+                vTaskDelay(pdMS_TO_TICKS(200));
+            }
+            
+            esp_zb_factory_reset(); // Device will restart
+            
+        } else if(press_ms >= 500) {
+            // Short press - Rejoin current network
+            TickType_t current_time = xTaskGetTickCount();
+            
+            if ((current_time - last_rejoin_time) > pdMS_TO_TICKS(REJOIN_COOLDOWN_MS)) {
+                ESP_LOGI(TAG, "Button pressed - triggering rejoin");
+                
+                // Blink once to indicate rejoin
+                light_driver_set_power(true);
+                vTaskDelay(pdMS_TO_TICKS(300));
+                light_driver_set_power(false);
+                
+                esp_zb_lock_acquire(portMAX_DELAY);
+                esp_err_t err = esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
+                esp_zb_lock_release();
+                
+                if (err == ESP_OK) {
+                    last_rejoin_time = current_time;
+                    ESP_LOGI(TAG, "Rejoin initiated successfully");
+                } else {
+                    ESP_LOGW(TAG, "Rejoin failed: %s", esp_err_to_name(err));
+                }
+            }
+        } else {
+            ESP_LOGD(TAG, "False trigger - noise detected");
+        }
+    }
+}
+
+
 /********************* Define functions **************************/
 static esp_err_t deferred_driver_init(void)
 {
@@ -146,5 +229,20 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_zb_platform_config(&config));
+
+    // Button setup
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << BUTTON_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,  // Enable internal pull-down
+        .intr_type = GPIO_INTR_POSEDGE
+    };
+    gpio_config(&io_conf);
+    
+    TaskHandle_t button_task_handle = NULL;
+    xTaskCreate(button_task, "button_task", 2048, NULL, 5, &button_task_handle);
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(BUTTON_GPIO, button_isr_handler, (void*)button_task_handle);
     xTaskCreate(esp_zb_task, "Zigbee_main", 4096, NULL, 5, NULL);
 }
