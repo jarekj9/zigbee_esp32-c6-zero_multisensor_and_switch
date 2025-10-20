@@ -42,6 +42,16 @@ static const char *TAG = "ESP_ZB_ON_OFF_LIGHT";
 static volatile uint32_t last_interrupt_time = 0;
 static TaskHandle_t buzzer_task_handle = NULL;
 
+/********************* LED Functions **************************/
+static void blink_led(int times, uint32_t on_time_ms, uint32_t off_time_ms)
+{
+    for (int i = 0; i < times; i++) {
+        light_driver_set_power(1);
+        vTaskDelay(pdMS_TO_TICKS(on_time_ms));
+        light_driver_set_power(0);
+        vTaskDelay(pdMS_TO_TICKS(off_time_ms));
+    }
+}
 /********************* Buzzer Functions **************************/
 static void buzzer_tone(uint32_t frequency, uint32_t duration_ms)
 {
@@ -130,7 +140,9 @@ static void button_task(void *pvParameter)
         
         if(press_ms >= 5000) {
             ESP_LOGW(TAG, "Factory reset triggered");
+            blink_led(5, 100, 100);
             esp_zb_factory_reset();
+            
             
         } else if(press_ms >= 500) {
             TickType_t current_time = xTaskGetTickCount();
@@ -145,6 +157,7 @@ static void button_task(void *pvParameter)
                 if (err == ESP_OK) {
                     last_rejoin_time = current_time;
                     ESP_LOGI(TAG, "Rejoin initiated successfully");
+                    blink_led(2, 100, 100);
                 } else {
                     ESP_LOGW(TAG, "Rejoin failed: %s", esp_err_to_name(err));
                 }
@@ -230,7 +243,7 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
             if (message->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID && message->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_BOOL) {
                 light_state = message->attribute.data.value ? *(bool *)message->attribute.data.value : light_state;
                 ESP_LOGI(TAG, "Light sets to %s", light_state ? "On" : "Off");
-                light_driver_set_power(light_state);
+                //light_driver_set_power(light_state);
                 
                 // Play melody when triggered
                 buzzer_play_melody_async();
