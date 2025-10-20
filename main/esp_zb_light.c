@@ -17,9 +17,9 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "driver/gpio.h"
+#include "driver/ledc.h"
 #include "ha/esp_zigbee_ha_standard.h"
 #include "esp_zb_light.h"
-#include "driver/ledc.h" // Include LEDC driver for buzzer control
 
 #if !defined ZB_ED_ROLE
 #error Define ZB_ED_ROLE in idf.py menuconfig to compile light (End Device) source code.
@@ -28,20 +28,81 @@
 #define BUTTON_GPIO GPIO_NUM_2
 #define BUZZER_GPIO GPIO_NUM_20
 #define BUZZER_CHANNEL LEDC_CHANNEL_1
-#define BUZZER_TIMER LEDC_TIMER_1 
-#define BUTTON_DEBOUNCE_MS 500  // Aggressive debounce
-#define REJOIN_COOLDOWN_MS 5000  // 5 second cooldown
+#define BUZZER_TIMER LEDC_TIMER_1
+#define BUTTON_DEBOUNCE_MS 500
+#define REJOIN_COOLDOWN_MS 5000
+
+// Note frequencies in Hz
+#define NOTE_C5 523
+#define NOTE_E5 659
+#define NOTE_G5 784
+#define NOTE_C6 1047
 
 static const char *TAG = "ESP_ZB_ON_OFF_LIGHT";
 static volatile uint32_t last_interrupt_time = 0;
+static TaskHandle_t buzzer_task_handle = NULL;
 
+/********************* Buzzer Functions **************************/
+static void buzzer_tone(uint32_t frequency, uint32_t duration_ms)
+{
+    ledc_set_freq(LEDC_LOW_SPEED_MODE, BUZZER_TIMER, frequency);
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, BUZZER_CHANNEL, 512);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, BUZZER_CHANNEL);
+    vTaskDelay(pdMS_TO_TICKS(duration_ms));
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, BUZZER_CHANNEL, 0);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, BUZZER_CHANNEL);
+}
 
-/********************* Button **************************/
+static void buzzer_task(void *pvParameter)
+{
+    while(1) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        
+        // Play short melody: C5-E5-G5-C6
+        buzzer_tone(NOTE_C5, 150);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        buzzer_tone(NOTE_E5, 150);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        buzzer_tone(NOTE_G5, 150);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        buzzer_tone(NOTE_C6, 200);
+    }
+}
+
+static void buzzer_play_melody_async(void)
+{
+    if(buzzer_task_handle != NULL) {
+        xTaskNotify(buzzer_task_handle, 0, eNoAction);
+    }
+}
+
+static void buzzer_init(void)
+{
+    ledc_timer_config_t timer_conf = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = LEDC_TIMER_10_BIT,
+        .timer_num = BUZZER_TIMER,
+        .freq_hz = NOTE_C5,
+        .clk_cfg = LEDC_AUTO_CLK
+    };
+    ledc_timer_config(&timer_conf);
+    
+    ledc_channel_config_t channel_conf = {
+        .gpio_num = BUZZER_GPIO,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = BUZZER_CHANNEL,
+        .timer_sel = BUZZER_TIMER,
+        .duty = 0,
+        .hpoint = 0
+    };
+    ledc_channel_config(&channel_conf);
+}
+
+/********************* Button Functions **************************/
 static void IRAM_ATTR button_isr_handler(void* arg)
 {
     uint32_t now = xTaskGetTickCountFromISR();
     
-    // Debounce in ISR - ignore if less than 500ms since last interrupt
     if ((now - last_interrupt_time) > pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS)) {
         last_interrupt_time = now;
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
@@ -57,11 +118,9 @@ static void button_task(void *pvParameter)
     while(1) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         
-        // Measure how long button is held
         TickType_t press_start = xTaskGetTickCount();
-        vTaskDelay(pdMS_TO_TICKS(100)); // Initial debounce
+        vTaskDelay(pdMS_TO_TICKS(100));
         
-        // Wait while button is pressed and count time
         while(gpio_get_level(BUTTON_GPIO) == 1) {
             vTaskDelay(pdMS_TO_TICKS(100));
         }
@@ -70,12 +129,10 @@ static void button_task(void *pvParameter)
         uint32_t press_ms = pdTICKS_TO_MS(press_duration);
         
         if(press_ms >= 5000) {
-            // Long press - Factory reset (NO LED BLINK)
-            ESP_LOGW(TAG, "Factory reset triggered - erasing network data");
-            esp_zb_factory_reset(); // Device will restart
+            ESP_LOGW(TAG, "Factory reset triggered");
+            esp_zb_factory_reset();
             
         } else if(press_ms >= 500) {
-            // Short press - Rejoin current network (NO LED BLINK)
             TickType_t current_time = xTaskGetTickCount();
             
             if ((current_time - last_rejoin_time) > pdMS_TO_TICKS(REJOIN_COOLDOWN_MS)) {
@@ -99,54 +156,8 @@ static void button_task(void *pvParameter)
         }
     }
 }
-/********************* Buzzer **************************/
-static TaskHandle_t buzzer_task_handle = NULL;
 
-static void buzzer_task(void *pvParameter)
-{
-    while(1) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  // Wait for notification
-        
-        // Play beep
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, BUZZER_CHANNEL, 512);
-        ledc_update_duty(LEDC_LOW_SPEED_MODE, BUZZER_CHANNEL);
-        vTaskDelay(pdMS_TO_TICKS(100));
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, BUZZER_CHANNEL, 0);
-        ledc_update_duty(LEDC_LOW_SPEED_MODE, BUZZER_CHANNEL);
-    }
-}
-
-// Non-blocking buzzer trigger
-static void buzzer_beep_async(void)
-{
-    if(buzzer_task_handle != NULL) {
-        xTaskNotify(buzzer_task_handle, 0, eNoAction);  // Trigger buzzer task
-    }
-}
-
-static void buzzer_init(void)
-{
-    ledc_timer_config_t timer_conf = {
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .duty_resolution = LEDC_TIMER_10_BIT,
-        .timer_num = BUZZER_TIMER,
-        .freq_hz = 2000,
-        .clk_cfg = LEDC_AUTO_CLK
-    };
-    ledc_timer_config(&timer_conf);
-    
-    ledc_channel_config_t channel_conf = {
-        .gpio_num = BUZZER_GPIO,
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .channel = BUZZER_CHANNEL,
-        .timer_sel = BUZZER_TIMER,
-        .duty = 0,
-        .hpoint = 0
-    };
-    ledc_channel_config(&channel_conf);
-}
-
-/********************* Define functions **************************/
+/********************* Zigbee Functions **************************/
 static esp_err_t deferred_driver_init(void)
 {
     light_driver_init(LIGHT_DEFAULT_OFF);
@@ -160,9 +171,10 @@ static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
 
 void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
 {
-    uint32_t *p_sg_p       = signal_struct->p_app_signal;
+    uint32_t *p_sg_p = signal_struct->p_app_signal;
     esp_err_t err_status = signal_struct->esp_err_status;
     esp_zb_app_signal_type_t sig_type = *p_sg_p;
+    
     switch (sig_type) {
     case ESP_ZB_ZDO_SIGNAL_SKIP_STARTUP:
         ESP_LOGI(TAG, "Initialize Zigbee stack");
@@ -180,7 +192,6 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                 ESP_LOGI(TAG, "Device rebooted");
             }
         } else {
-            /* commissioning failed */
             ESP_LOGW(TAG, "Failed to initialize Zigbee stack (status: %s)", esp_err_to_name(err_status));
         }
         break;
@@ -198,8 +209,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         }
         break;
     default:
-        ESP_LOGI(TAG, "ZDO signal: %s (0x%x), status: %s", esp_zb_zdo_signal_to_string(sig_type), sig_type,
-                 esp_err_to_name(err_status));
+        ESP_LOGI(TAG, "ZDO signal: %s (0x%x), status: %s", esp_zb_zdo_signal_to_string(sig_type), sig_type, esp_err_to_name(err_status));
         break;
     }
 }
@@ -210,10 +220,11 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
     bool light_state = 0;
 
     ESP_RETURN_ON_FALSE(message, ESP_FAIL, TAG, "Empty message");
-    ESP_RETURN_ON_FALSE(message->info.status == ESP_ZB_ZCL_STATUS_SUCCESS, ESP_ERR_INVALID_ARG, TAG, "Received message: error status(%d)",
-                        message->info.status);
-    ESP_LOGI(TAG, "Received message: endpoint(%d), cluster(0x%x), attribute(0x%x), data size(%d)", message->info.dst_endpoint, message->info.cluster,
-             message->attribute.id, message->attribute.data.size);
+    ESP_RETURN_ON_FALSE(message->info.status == ESP_ZB_ZCL_STATUS_SUCCESS, ESP_ERR_INVALID_ARG, TAG, "Received message: error status(%d)", message->info.status);
+    
+    ESP_LOGI(TAG, "Received message: endpoint(%d), cluster(0x%x), attribute(0x%x), data size(%d)", 
+             message->info.dst_endpoint, message->info.cluster, message->attribute.id, message->attribute.data.size);
+    
     if (message->info.dst_endpoint == HA_ESP_LIGHT_ENDPOINT) {
         if (message->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF) {
             if (message->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID && message->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_BOOL) {
@@ -221,10 +232,8 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
                 ESP_LOGI(TAG, "Light sets to %s", light_state ? "On" : "Off");
                 light_driver_set_power(light_state);
                 
-                // Non-blocking buzzer call
-                if(light_state) {
-                    buzzer_beep_async();  // Returns immediately, buzzer plays in background
-                }
+                // Play melody when triggered
+                buzzer_play_melody_async();
             }
         }
     }
@@ -247,7 +256,6 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
 
 static void esp_zb_task(void *pvParameters)
 {
-    /* initialize Zigbee stack */
     esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_ZED_CONFIG();
     esp_zb_init(&zb_nwk_cfg);
     esp_zb_on_off_light_cfg_t light_cfg = ESP_ZB_DEFAULT_ON_OFF_LIGHT_CONFIG();
@@ -290,8 +298,10 @@ void app_main(void)
     
     // Button task
     TaskHandle_t button_task_handle = NULL;
-    xTaskCreate(button_task, "button_task", 2048, NULL, 5, &button_task_handle); 
+    xTaskCreate(button_task, "button_task", 2048, NULL, 5, &button_task_handle);
+    
     gpio_install_isr_service(0);
-    gpio_isr_handler_add(BUTTON_GPIO, button_isr_handler, (void*)button_task_handle); 
+    gpio_isr_handler_add(BUTTON_GPIO, button_isr_handler, (void*)button_task_handle);
+    
     xTaskCreate(esp_zb_task, "Zigbee_main", 4096, NULL, 5, NULL);
 }
