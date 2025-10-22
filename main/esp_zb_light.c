@@ -33,10 +33,16 @@
 #define REJOIN_COOLDOWN_MS 5000
 
 // Note frequencies in Hz
-#define NOTE_C5 523
-#define NOTE_E5 659
-#define NOTE_G5 784
-#define NOTE_C6 1047
+#define NOTE_E5  659
+#define NOTE_C5  523
+#define NOTE_G5  784
+#define NOTE_G4  392
+#define NOTE_E4  330
+#define NOTE_A4  440
+#define NOTE_B4  494
+#define NOTE_A4S 466
+#define NOTE_D5  587
+#define NOTE_F5  698
 
 static const char *TAG = "ESP_ZB_ON_OFF_LIGHT";
 static volatile uint32_t last_interrupt_time = 0;
@@ -68,14 +74,23 @@ static void buzzer_task(void *pvParameter)
     while(1) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         
-        // Play short melody: C5-E5-G5-C6
-        buzzer_tone(NOTE_C5, 150);
-        vTaskDelay(pdMS_TO_TICKS(50));
-        buzzer_tone(NOTE_E5, 150);
-        vTaskDelay(pdMS_TO_TICKS(50));
-        buzzer_tone(NOTE_G5, 150);
-        vTaskDelay(pdMS_TO_TICKS(50));
-        buzzer_tone(NOTE_C6, 200);
+        // Playful video game style melody
+        buzzer_tone(NOTE_E5, 120);
+        vTaskDelay(pdMS_TO_TICKS(30));
+        buzzer_tone(NOTE_E5, 120);
+        vTaskDelay(pdMS_TO_TICKS(150));
+        buzzer_tone(NOTE_E5, 120);
+        vTaskDelay(pdMS_TO_TICKS(150));
+        
+        buzzer_tone(NOTE_C5, 120);
+        vTaskDelay(pdMS_TO_TICKS(30));
+        buzzer_tone(NOTE_E5, 120);
+        vTaskDelay(pdMS_TO_TICKS(150));
+        buzzer_tone(NOTE_G5, 120);
+        vTaskDelay(pdMS_TO_TICKS(350));
+        
+        buzzer_tone(NOTE_G4, 120);
+        vTaskDelay(pdMS_TO_TICKS(350));
     }
 }
 
