@@ -20,6 +20,7 @@
 #include "driver/ledc.h"
 #include "ha/esp_zigbee_ha_standard.h"
 #include "esp_zb_light.h"
+#include "mhz19b_driver.h"
 
 #if !defined ZB_ED_ROLE
 #error Define ZB_ED_ROLE in idf.py menuconfig to compile light (End Device) source code.
@@ -47,6 +48,18 @@
 static const char *TAG = "ESP_ZB_ON_OFF_LIGHT";
 static volatile uint32_t last_interrupt_time = 0;
 static TaskHandle_t buzzer_task_handle = NULL;
+static TaskHandle_t co2_sensor_task_handle = NULL;
+static esp_zb_zcl_reporting_info_t co2_reporting_info;
+
+/* Static variables for CO2 cluster attributes (must persist for Zigbee stack) */
+/* ZCL Carbon Dioxide Measurement uses single precision float (0.0 - 1.0 range) */
+/* Value = ppm / 1000000.0 (e.g., 1007 ppm = 0.001007) */
+static float s_co2_measured_value = 0.0f / 0.0f;  // NaN = invalid/unavailable
+static float s_co2_min_value = 0.0f;              // 0 ppm = 0.0
+static float s_co2_max_value = 0.5f;              // 500000 ppm = 0.5 (max reasonable)
+
+/* Flag to indicate Zigbee is ready for attribute updates */
+static volatile bool s_zigbee_ready = false;
 
 /********************* LED Functions **************************/
 static void blink_led(int times, uint32_t on_time_ms, uint32_t off_time_ms)
@@ -192,6 +205,100 @@ static esp_err_t deferred_driver_init(void)
     return ESP_OK;
 }
 
+/********************* CO2 Sensor Functions **************************/
+
+/* Helper function to send explicit attribute report to coordinator */
+static void co2_send_report(void)
+{
+    esp_zb_zcl_report_attr_cmd_t cmd = {
+        .zcl_basic_cmd = {
+            .dst_addr_u.addr_short = 0x0000,  /* Coordinator */
+            .dst_endpoint = 1,                /* Coordinator endpoint */
+            .src_endpoint = HA_ESP_CO2_SENSOR_ENDPOINT,
+        },
+        .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .clusterID = ESP_ZB_ZCL_CLUSTER_ID_CARBON_DIOXIDE_MEASUREMENT,
+        .manuf_specific = 0,
+        .direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI,
+        .dis_default_resp = 1,
+        .manuf_code = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC,
+        .attributeID = ESP_ZB_ZCL_ATTR_CARBON_DIOXIDE_MEASUREMENT_MEASURED_VALUE_ID,
+    };
+
+    esp_err_t err = esp_zb_zcl_report_attr_cmd_req(&cmd);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to send CO2 report: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGD(TAG, "CO2 report sent successfully");
+    }
+}
+
+static void co2_sensor_task(void *pvParameter)
+{
+    mhz19b_reading_t reading;
+    TickType_t last_wake_time = xTaskGetTickCount();
+
+    ESP_LOGI(TAG, "CO2 sensor task started, reporting every %d seconds", CO2_REPORTING_INTERVAL_SEC);
+
+    while (1) {
+        // Only read sensor if Zigbee is ready
+        if (!s_zigbee_ready) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            last_wake_time = xTaskGetTickCount();  // Reset after delay
+            continue;
+        }
+
+        esp_err_t err = mhz19b_read_co2(&reading);
+
+        if (err == ESP_OK && reading.valid) {
+            ESP_LOGI(TAG, "CO2 reading: %u ppm", reading.co2_ppm);
+
+            // Update the static variable and report via Zigbee
+            if (esp_zb_lock_acquire(pdMS_TO_TICKS(1000))) {
+                /* Convert ppm to ZCL float value (0.0 - 1.0 range) */
+                /* ZCL Carbon Dioxide: value = ppm / 1000000.0 */
+                s_co2_measured_value = (float)reading.co2_ppm / 1000000.0f;
+
+                esp_zb_zcl_set_attribute_val(HA_ESP_CO2_SENSOR_ENDPOINT,
+                                              ESP_ZB_ZCL_CLUSTER_ID_CARBON_DIOXIDE_MEASUREMENT,
+                                              ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+                                              ESP_ZB_ZCL_ATTR_CARBON_DIOXIDE_MEASUREMENT_MEASURED_VALUE_ID,
+                                              &s_co2_measured_value,
+                                              false);
+
+                /* Send explicit report to coordinator */
+                co2_send_report();
+
+                esp_zb_lock_release();
+            } else {
+                ESP_LOGW(TAG, "Failed to acquire Zigbee lock for CO2 reporting");
+            }
+        } else {
+            ESP_LOGW(TAG, "CO2 sensor read failed: %s", mhz19b_err_to_str(reading.error));
+
+            // Report invalid value (unavailable - NaN)
+            if (esp_zb_lock_acquire(pdMS_TO_TICKS(1000))) {
+                s_co2_measured_value = 0.0f / 0.0f;  /* NaN = invalid */
+
+                esp_zb_zcl_set_attribute_val(HA_ESP_CO2_SENSOR_ENDPOINT,
+                                              ESP_ZB_ZCL_CLUSTER_ID_CARBON_DIOXIDE_MEASUREMENT,
+                                              ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+                                              ESP_ZB_ZCL_ATTR_CARBON_DIOXIDE_MEASUREMENT_MEASURED_VALUE_ID,
+                                              &s_co2_measured_value,
+                                              false);
+
+                /* Send explicit report to coordinator */
+                co2_send_report();
+
+                esp_zb_lock_release();
+            }
+        }
+
+        // Wait for next interval
+        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(CO2_REPORTING_INTERVAL_SEC * 1000));
+    }
+}
+
 static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
 {
     ESP_RETURN_ON_FALSE(esp_zb_bdb_start_top_level_commissioning(mode_mask) == ESP_OK, , TAG, "Failed to start Zigbee commissioning");
@@ -202,7 +309,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
     uint32_t *p_sg_p = signal_struct->p_app_signal;
     esp_err_t err_status = signal_struct->esp_err_status;
     esp_zb_app_signal_type_t sig_type = *p_sg_p;
-    
+
     switch (sig_type) {
     case ESP_ZB_ZDO_SIGNAL_SKIP_STARTUP:
         ESP_LOGI(TAG, "Initialize Zigbee stack");
@@ -218,6 +325,8 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                 esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
             } else {
                 ESP_LOGI(TAG, "Device rebooted");
+                /* Device is already on network, signal that Zigbee is ready */
+                s_zigbee_ready = true;
             }
         } else {
             ESP_LOGW(TAG, "Failed to initialize Zigbee stack (status: %s)", esp_err_to_name(err_status));
@@ -231,6 +340,8 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                      extended_pan_id[7], extended_pan_id[6], extended_pan_id[5], extended_pan_id[4],
                      extended_pan_id[3], extended_pan_id[2], extended_pan_id[1], extended_pan_id[0],
                      esp_zb_get_pan_id(), esp_zb_get_current_channel(), esp_zb_get_short_address());
+            /* Signal that Zigbee is ready for attribute updates */
+            s_zigbee_ready = true;
         } else {
             ESP_LOGI(TAG, "Network steering was not successful (status: %s)", esp_err_to_name(err_status));
             esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb, ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
@@ -286,16 +397,96 @@ static void esp_zb_task(void *pvParameters)
 {
     esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_ZED_CONFIG();
     esp_zb_init(&zb_nwk_cfg);
+
+    /* === Endpoint 10: On/Off Light (Buzzer control) - keep original === */
     esp_zb_on_off_light_cfg_t light_cfg = ESP_ZB_DEFAULT_ON_OFF_LIGHT_CONFIG();
-    esp_zb_ep_list_t *esp_zb_on_off_light_ep = esp_zb_on_off_light_ep_create(HA_ESP_LIGHT_ENDPOINT, &light_cfg);
+    esp_zb_ep_list_t *ep_list = esp_zb_on_off_light_ep_create(HA_ESP_LIGHT_ENDPOINT, &light_cfg);
+
+    /* === Endpoint 11: Carbon Dioxide Sensor === */
+    /* Create cluster list for CO2 sensor */
+    esp_zb_cluster_list_t *co2_cluster_list = esp_zb_zcl_cluster_list_create();
+
+    /* Create and add basic cluster */
+    esp_zb_basic_cluster_cfg_t basic_cfg = {
+        .zcl_version = ESP_ZB_ZCL_BASIC_ZCL_VERSION_DEFAULT_VALUE,
+        .power_source = ESP_ZB_ZCL_BASIC_POWER_SOURCE_DEFAULT_VALUE,
+    };
+    esp_zb_attribute_list_t *basic_cluster = esp_zb_basic_cluster_create(&basic_cfg);
+    esp_zb_cluster_list_add_basic_cluster(co2_cluster_list, basic_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+
+    /* Create and add identify cluster */
+    esp_zb_identify_cluster_cfg_t identify_cfg = {
+        .identify_time = 0,
+    };
+    esp_zb_attribute_list_t *identify_cluster = esp_zb_identify_cluster_create(&identify_cfg);
+    esp_zb_cluster_list_add_identify_cluster(co2_cluster_list, identify_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+
+    /* Create Carbon Dioxide Measurement cluster manually */
+    esp_zb_attribute_list_t *co2_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_CARBON_DIOXIDE_MEASUREMENT);
+
+    /* Add MeasuredValue attribute (0x0000) - single precision float */
+    /* MUST use static/global variables - Zigbee stores pointers! */
+    esp_zb_cluster_add_attr(co2_cluster, ESP_ZB_ZCL_CLUSTER_ID_CARBON_DIOXIDE_MEASUREMENT,
+                            ESP_ZB_ZCL_ATTR_CARBON_DIOXIDE_MEASUREMENT_MEASURED_VALUE_ID,
+                            ESP_ZB_ZCL_ATTR_TYPE_SINGLE, ESP_ZB_ZCL_ATTR_ACCESS_REPORTING | ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY,
+                            &s_co2_measured_value);
+
+    /* Add MinMeasuredValue attribute (0x0001) */
+    esp_zb_cluster_add_attr(co2_cluster, ESP_ZB_ZCL_CLUSTER_ID_CARBON_DIOXIDE_MEASUREMENT,
+                            ESP_ZB_ZCL_ATTR_CARBON_DIOXIDE_MEASUREMENT_MIN_MEASURED_VALUE_ID,
+                            ESP_ZB_ZCL_ATTR_TYPE_SINGLE, ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY,
+                            &s_co2_min_value);
+
+    /* Add MaxMeasuredValue attribute (0x0002) */
+    esp_zb_cluster_add_attr(co2_cluster, ESP_ZB_ZCL_CLUSTER_ID_CARBON_DIOXIDE_MEASUREMENT,
+                            ESP_ZB_ZCL_ATTR_CARBON_DIOXIDE_MEASUREMENT_MAX_MEASURED_VALUE_ID,
+                            ESP_ZB_ZCL_ATTR_TYPE_SINGLE, ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY,
+                            &s_co2_max_value);
+
+    /* Add CO2 measurement cluster to cluster list */
+    esp_zb_cluster_list_add_carbon_dioxide_measurement_cluster(co2_cluster_list, co2_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+
+    /* Add CO2 sensor endpoint to list */
+    esp_zb_endpoint_config_t co2_ep_config = {
+        .endpoint = HA_ESP_CO2_SENSOR_ENDPOINT,
+        .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .app_device_id = ESP_ZB_HA_SIMPLE_SENSOR_DEVICE_ID,
+        .app_device_version = 0,
+    };
+    esp_zb_ep_list_add_ep(ep_list, co2_cluster_list, co2_ep_config);
+
+    /* Add manufacturer info to both endpoints */
     zcl_basic_manufacturer_info_t info = {
         .manufacturer_name = ESP_MANUFACTURER_NAME,
         .model_identifier = ESP_MODEL_IDENTIFIER,
     };
+    esp_zcl_utility_add_ep_basic_manufacturer_info(ep_list, HA_ESP_LIGHT_ENDPOINT, &info);
+    esp_zcl_utility_add_ep_basic_manufacturer_info(ep_list, HA_ESP_CO2_SENSOR_ENDPOINT, &info);
 
-    esp_zcl_utility_add_ep_basic_manufacturer_info(esp_zb_on_off_light_ep, HA_ESP_LIGHT_ENDPOINT, &info);
-    esp_zb_device_register(esp_zb_on_off_light_ep);
+    /* Register device */
+    esp_zb_device_register(ep_list);
+
+    /* Register action handler */
     esp_zb_core_action_handler_register(zb_action_handler);
+
+    /* Configure reporting for CO2 sensor */
+    co2_reporting_info.direction = ESP_ZB_ZCL_REPORT_DIRECTION_SEND;
+    co2_reporting_info.ep = HA_ESP_CO2_SENSOR_ENDPOINT;
+    co2_reporting_info.cluster_id = ESP_ZB_ZCL_CLUSTER_ID_CARBON_DIOXIDE_MEASUREMENT;
+    co2_reporting_info.cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE;
+    co2_reporting_info.attr_id = ESP_ZB_ZCL_ATTR_CARBON_DIOXIDE_MEASUREMENT_MEASURED_VALUE_ID;
+    co2_reporting_info.manuf_code = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC;
+    co2_reporting_info.dst.short_addr = 0x0000; /* Coordinator */
+    co2_reporting_info.dst.endpoint = 1;        /* Typical coordinator endpoint */
+    co2_reporting_info.dst.profile_id = ESP_ZB_AF_HA_PROFILE_ID;
+    co2_reporting_info.u.send_info.min_interval = 30;   /* Minimum 30 seconds between reports */
+    co2_reporting_info.u.send_info.max_interval = 120;  /* Maximum 120 seconds between reports */
+    co2_reporting_info.u.send_info.delta.f32 = 0.00005f; /* Report if CO2 changes by 50 ppm (50/1000000) */
+    co2_reporting_info.u.send_info.def_min_interval = 30;
+    co2_reporting_info.u.send_info.def_max_interval = 120;
+
+    esp_zb_zcl_update_reporting_info(&co2_reporting_info);
+
     esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
     ESP_ERROR_CHECK(esp_zb_start(false));
     esp_zb_stack_main_loop();
@@ -323,13 +514,17 @@ void app_main(void)
     // Buzzer setup
     buzzer_init();
     xTaskCreate(buzzer_task, "buzzer_task", 2048, NULL, 5, &buzzer_task_handle);
-    
+
     // Button task
     TaskHandle_t button_task_handle = NULL;
     xTaskCreate(button_task, "button_task", 2048, NULL, 5, &button_task_handle);
-    
+
     gpio_install_isr_service(0);
     gpio_isr_handler_add(BUTTON_GPIO, button_isr_handler, (void*)button_task_handle);
-    
-    xTaskCreate(esp_zb_task, "Zigbee_main", 4096, NULL, 5, NULL);
+
+    // CO2 Sensor setup
+    ESP_ERROR_CHECK(mhz19b_init());
+    xTaskCreate(co2_sensor_task, "co2_sensor_task", 4096, NULL, 5, &co2_sensor_task_handle);
+
+    xTaskCreate(esp_zb_task, "Zigbee_main", 8192, NULL, 5, NULL);
 }
