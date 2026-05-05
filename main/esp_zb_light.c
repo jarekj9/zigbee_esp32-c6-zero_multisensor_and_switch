@@ -21,6 +21,8 @@
 #include "ha/esp_zigbee_ha_standard.h"
 #include "esp_zb_light.h"
 #include "mhz19b_driver.h"
+#include "sps30_driver.h"
+#include "zcl/esp_zigbee_zcl_pm2_5_measurement.h"
 
 #if !defined ZB_ED_ROLE
 #error Define ZB_ED_ROLE in idf.py menuconfig to compile light (End Device) source code.
@@ -49,7 +51,9 @@ static const char *TAG = "ESP_ZB_ON_OFF_LIGHT";
 static volatile uint32_t last_interrupt_time = 0;
 static TaskHandle_t buzzer_task_handle = NULL;
 static TaskHandle_t co2_sensor_task_handle = NULL;
+static TaskHandle_t pm25_sensor_task_handle = NULL;
 static esp_zb_zcl_reporting_info_t co2_reporting_info;
+static esp_zb_zcl_reporting_info_t pm25_reporting_info;
 
 /* Static variables for CO2 cluster attributes (must persist for Zigbee stack) */
 /* ZCL Carbon Dioxide Measurement uses single precision float (0.0 - 1.0 range) */
@@ -57,6 +61,13 @@ static esp_zb_zcl_reporting_info_t co2_reporting_info;
 static float s_co2_measured_value = 0.0f / 0.0f;  // NaN = invalid/unavailable
 static float s_co2_min_value = 0.0f;              // 0 ppm = 0.0
 static float s_co2_max_value = 0.5f;              // 500000 ppm = 0.5 (max reasonable)
+
+    /* Static variables for PM2.5 cluster attributes (must persist for Zigbee stack) */
+/* PM2.5 value in ug/m3 (Home Assistant expects raw value, not ZCL normalized) */
+static float s_pm25_measured_value = 0.0f / 0.0f; // NaN = invalid/unavailable
+static float s_pm25_min_value = 0.0f;             // 0 ug/m3
+static float s_pm25_max_value = 500.0f;           // 500 ug/m3 max
+static float s_pm25_tolerance = 10.0f;            // 10 ug/m3 tolerance
 
 /* Flag to indicate Zigbee is ready for attribute updates */
 static volatile bool s_zigbee_ready = false;
@@ -299,6 +310,137 @@ static void co2_sensor_task(void *pvParameter)
     }
 }
 
+/********************* PM2.5 Sensor Functions **************************/
+
+/* Helper function to send explicit attribute report for PM2.5 to coordinator */
+static void pm25_send_report(float raw_value_ug_m3)
+{
+    // Report PM2.5 Measurement cluster (raw ug/m3 value)
+    esp_zb_zcl_report_attr_cmd_t cmd = {
+        .zcl_basic_cmd = {
+            .dst_addr_u.addr_short = 0x0000,  /* Coordinator */
+            .dst_endpoint = 1,                /* Coordinator endpoint */
+            .src_endpoint = HA_ESP_PM25_SENSOR_ENDPOINT,
+        },
+        .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .clusterID = ESP_ZB_ZCL_CLUSTER_ID_PM2_5_MEASUREMENT,
+        .manuf_specific = 0,
+        .direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI,
+        .dis_default_resp = 1,
+        .manuf_code = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC,
+        .attributeID = ESP_ZB_ZCL_ATTR_PM2_5_MEASUREMENT_MEASURED_VALUE_ID,
+    };
+
+    ESP_LOGI(TAG, "Sending PM2.5 report to coordinator (value=%.2f ug/m3)", raw_value_ug_m3);
+    
+    esp_err_t err = esp_zb_zcl_report_attr_cmd_req(&cmd);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to send PM2.5 report: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "PM2.5 report sent successfully");
+    }
+}
+
+static void pm25_sensor_task(void *pvParameter)
+{
+    sps30_reading_t reading;
+    TickType_t last_wake_time = xTaskGetTickCount();
+
+    ESP_LOGI(TAG, "PM2.5 sensor task started, reporting every %d seconds", PM25_REPORTING_INTERVAL_SEC);
+
+    while (1) {
+        // Only read sensor if Zigbee is ready and sensor is available
+        if (!s_zigbee_ready) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            last_wake_time = xTaskGetTickCount();  // Reset after delay
+            continue;
+        }
+
+        // Check if sensor is available
+        if (!sps30_is_available()) {
+            ESP_LOGD(TAG, "SPS30 not available, skipping PM2.5 reading");
+            vTaskDelay(pdMS_TO_TICKS(PM25_REPORTING_INTERVAL_SEC * 1000));
+            last_wake_time = xTaskGetTickCount();
+            continue;
+        }
+
+        // Start measurement (fan starts spinning)
+        ESP_LOGI(TAG, "Starting SPS30 measurement...");
+        esp_err_t err = sps30_start_measurement();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to start SPS30 measurement: %s", esp_err_to_name(err));
+            vTaskDelay(pdMS_TO_TICKS(PM25_REPORTING_INTERVAL_SEC * 1000));
+            last_wake_time = xTaskGetTickCount();
+            continue;
+        }
+
+        // Wait for fan to stabilize (datasheet says ~10 seconds for accurate readings)
+        ESP_LOGI(TAG, "Waiting for SPS30 fan to stabilize...");
+        vTaskDelay(pdMS_TO_TICKS(10000));
+
+        // Read measurement
+        err = sps30_read_measurement(&reading);
+
+        if (err == ESP_OK && reading.valid) {
+            ESP_LOGI(TAG, "PM2.5 reading: %.2f ug/m3", reading.pm2_5);
+
+            // Update the static variable and report via Zigbee
+            if (esp_zb_lock_acquire(pdMS_TO_TICKS(1000))) {
+                // Use raw value for PM2.5 cluster (Home Assistant expects ug/m3 directly)
+                s_pm25_measured_value = reading.pm2_5;
+
+                ESP_LOGI(TAG, "Setting PM2.5 attribute to %.2f ug/m3 (endpoint %d)", 
+                         s_pm25_measured_value, HA_ESP_PM25_SENSOR_ENDPOINT);
+
+                // Set PM2.5 Measurement cluster attribute (raw ug/m3)
+                esp_err_t set_err = esp_zb_zcl_set_attribute_val(HA_ESP_PM25_SENSOR_ENDPOINT,
+                                              ESP_ZB_ZCL_CLUSTER_ID_PM2_5_MEASUREMENT,
+                                              ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+                                              ESP_ZB_ZCL_ATTR_PM2_5_MEASUREMENT_MEASURED_VALUE_ID,
+                                              &s_pm25_measured_value,
+                                              false);
+                
+                if (set_err != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to set PM2.5 attribute: %s", esp_err_to_name(set_err));
+                }
+
+                /* Send explicit report to coordinator */
+                pm25_send_report(reading.pm2_5);
+
+                esp_zb_lock_release();
+            } else {
+                ESP_LOGW(TAG, "Failed to acquire Zigbee lock for PM2.5 reporting");
+            }
+        } else {
+            ESP_LOGW(TAG, "PM2.5 sensor read failed: %s", sps30_err_to_str(reading.error));
+
+            // Report invalid value (unavailable - NaN)
+            if (esp_zb_lock_acquire(pdMS_TO_TICKS(1000))) {
+                s_pm25_measured_value = 0.0f / 0.0f;  /* NaN = invalid */
+
+                esp_zb_zcl_set_attribute_val(HA_ESP_PM25_SENSOR_ENDPOINT,
+                                              ESP_ZB_ZCL_CLUSTER_ID_PM2_5_MEASUREMENT,
+                                              ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+                                              ESP_ZB_ZCL_ATTR_PM2_5_MEASUREMENT_MEASURED_VALUE_ID,
+                                              &s_pm25_measured_value,
+                                              false);
+
+                /* Send explicit report to coordinator */
+                pm25_send_report(0.0f / 0.0f);
+
+                esp_zb_lock_release();
+            }
+        }
+
+        // Stop measurement to turn off fan (save power and extend fan life)
+        sps30_stop_measurement();
+        ESP_LOGI(TAG, "SPS30 measurement stopped, fan off");
+
+        // Wait for next interval
+        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(PM25_REPORTING_INTERVAL_SEC * 1000));
+    }
+}
+
 static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
 {
     ESP_RETURN_ON_FALSE(esp_zb_bdb_start_top_level_commissioning(mode_mask) == ESP_OK, , TAG, "Failed to start Zigbee commissioning");
@@ -455,13 +597,75 @@ static void esp_zb_task(void *pvParameters)
     };
     esp_zb_ep_list_add_ep(ep_list, co2_cluster_list, co2_ep_config);
 
-    /* Add manufacturer info to both endpoints */
+    /* === Endpoint 12: PM2.5 Sensor === */
+    /* Create cluster list for PM2.5 sensor */
+    esp_zb_cluster_list_t *pm25_cluster_list = esp_zb_zcl_cluster_list_create();
+
+    /* Create and add basic cluster for PM2.5 */
+    esp_zb_attribute_list_t *pm25_basic_cluster = esp_zb_basic_cluster_create(&basic_cfg);
+    esp_zb_cluster_list_add_basic_cluster(pm25_cluster_list, pm25_basic_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+
+    /* Create and add identify cluster for PM2.5 */
+    esp_zb_attribute_list_t *pm25_identify_cluster = esp_zb_identify_cluster_create(&identify_cfg);
+    esp_zb_cluster_list_add_identify_cluster(pm25_cluster_list, pm25_identify_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+
+    /* Create PM2.5 Measurement cluster manually */
+    esp_zb_attribute_list_t *pm25_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_PM2_5_MEASUREMENT);
+
+    /* Add MeasuredValue attribute (0x0000) - single precision float */
+    /* MUST use static/global variables - Zigbee stores pointers! */
+    esp_zb_cluster_add_attr(pm25_cluster, ESP_ZB_ZCL_CLUSTER_ID_PM2_5_MEASUREMENT,
+                            ESP_ZB_ZCL_ATTR_PM2_5_MEASUREMENT_MEASURED_VALUE_ID,
+                            ESP_ZB_ZCL_ATTR_TYPE_SINGLE, ESP_ZB_ZCL_ATTR_ACCESS_REPORTING | ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY,
+                            &s_pm25_measured_value);
+
+    /* Add MinMeasuredValue attribute (0x0001) */
+    esp_zb_cluster_add_attr(pm25_cluster, ESP_ZB_ZCL_CLUSTER_ID_PM2_5_MEASUREMENT,
+                            ESP_ZB_ZCL_ATTR_PM2_5_MEASUREMENT_MIN_MEASURED_VALUE_ID,
+                            ESP_ZB_ZCL_ATTR_TYPE_SINGLE, ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY,
+                            &s_pm25_min_value);
+
+    /* Add MaxMeasuredValue attribute (0x0002) */
+    esp_zb_cluster_add_attr(pm25_cluster, ESP_ZB_ZCL_CLUSTER_ID_PM2_5_MEASUREMENT,
+                            ESP_ZB_ZCL_ATTR_PM2_5_MEASUREMENT_MAX_MEASURED_VALUE_ID,
+                            ESP_ZB_ZCL_ATTR_TYPE_SINGLE, ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY,
+                            &s_pm25_max_value);
+
+    /* Add Tolerance attribute (0x0003) */
+    esp_zb_cluster_add_attr(pm25_cluster, ESP_ZB_ZCL_CLUSTER_ID_PM2_5_MEASUREMENT,
+                            ESP_ZB_ZCL_ATTR_PM2_5_MEASUREMENT_TOLERANCE_ID,
+                            ESP_ZB_ZCL_ATTR_TYPE_SINGLE, ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY,
+                            &s_pm25_tolerance);
+
+    /* Add PM2.5 measurement cluster to cluster list */
+    esp_zb_cluster_list_add_pm2_5_measurement_cluster(pm25_cluster_list, pm25_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+
+    /* Create Analog Input cluster for PM2.5 (backup for compatibility) */
+    esp_zb_analog_input_cluster_cfg_t analog_input_cfg = {
+        .out_of_service = false,
+        .present_value = 0.0f,
+        .status_flags = 0,
+    };
+    esp_zb_attribute_list_t *analog_input_cluster = esp_zb_analog_input_cluster_create(&analog_input_cfg);
+    esp_zb_cluster_list_add_analog_input_cluster(pm25_cluster_list, analog_input_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+
+    /* Add PM2.5 sensor endpoint to list */
+    esp_zb_endpoint_config_t pm25_ep_config = {
+        .endpoint = HA_ESP_PM25_SENSOR_ENDPOINT,
+        .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .app_device_id = ESP_ZB_HA_SIMPLE_SENSOR_DEVICE_ID,
+        .app_device_version = 0,
+    };
+    esp_zb_ep_list_add_ep(ep_list, pm25_cluster_list, pm25_ep_config);
+
+    /* Add manufacturer info to all endpoints */
     zcl_basic_manufacturer_info_t info = {
         .manufacturer_name = ESP_MANUFACTURER_NAME,
         .model_identifier = ESP_MODEL_IDENTIFIER,
     };
     esp_zcl_utility_add_ep_basic_manufacturer_info(ep_list, HA_ESP_LIGHT_ENDPOINT, &info);
     esp_zcl_utility_add_ep_basic_manufacturer_info(ep_list, HA_ESP_CO2_SENSOR_ENDPOINT, &info);
+    esp_zcl_utility_add_ep_basic_manufacturer_info(ep_list, HA_ESP_PM25_SENSOR_ENDPOINT, &info);
 
     /* Register device */
     esp_zb_device_register(ep_list);
@@ -486,6 +690,24 @@ static void esp_zb_task(void *pvParameters)
     co2_reporting_info.u.send_info.def_max_interval = 120;
 
     esp_zb_zcl_update_reporting_info(&co2_reporting_info);
+
+    /* Configure reporting for PM2.5 sensor */
+    pm25_reporting_info.direction = ESP_ZB_ZCL_REPORT_DIRECTION_SEND;
+    pm25_reporting_info.ep = HA_ESP_PM25_SENSOR_ENDPOINT;
+    pm25_reporting_info.cluster_id = ESP_ZB_ZCL_CLUSTER_ID_PM2_5_MEASUREMENT;
+    pm25_reporting_info.cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE;
+    pm25_reporting_info.attr_id = ESP_ZB_ZCL_ATTR_PM2_5_MEASUREMENT_MEASURED_VALUE_ID;
+    pm25_reporting_info.manuf_code = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC;
+    pm25_reporting_info.dst.short_addr = 0x0000; /* Coordinator */
+    pm25_reporting_info.dst.endpoint = 1;        /* Typical coordinator endpoint */
+    pm25_reporting_info.dst.profile_id = ESP_ZB_AF_HA_PROFILE_ID;
+    pm25_reporting_info.u.send_info.min_interval = 30;   /* Minimum 30 seconds between reports */
+    pm25_reporting_info.u.send_info.max_interval = 120;  /* Maximum 120 seconds between reports */
+    pm25_reporting_info.u.send_info.delta.f32 = 0.5f;    /* Report if PM2.5 changes by 0.5 ug/m3 */
+    pm25_reporting_info.u.send_info.def_min_interval = 30;
+    pm25_reporting_info.u.send_info.def_max_interval = 120;
+
+    esp_zb_zcl_update_reporting_info(&pm25_reporting_info);
 
     esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
     ESP_ERROR_CHECK(esp_zb_start(false));
@@ -525,6 +747,14 @@ void app_main(void)
     // CO2 Sensor setup
     ESP_ERROR_CHECK(mhz19b_init());
     xTaskCreate(co2_sensor_task, "co2_sensor_task", 4096, NULL, 5, &co2_sensor_task_handle);
+
+    // PM2.5 Sensor setup (SPS30) - non-critical, won't fail if sensor not connected
+    esp_err_t sps30_err = sps30_init();
+    if (sps30_err == ESP_OK) {
+        xTaskCreate(pm25_sensor_task, "pm25_sensor_task", 4096, NULL, 5, &pm25_sensor_task_handle);
+    } else {
+        ESP_LOGW(TAG, "SPS30 initialization failed, continuing without PM2.5 sensor");
+    }
 
     xTaskCreate(esp_zb_task, "Zigbee_main", 8192, NULL, 5, NULL);
 }
