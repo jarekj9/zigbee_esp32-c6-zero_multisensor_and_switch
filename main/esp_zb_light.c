@@ -22,6 +22,7 @@
 #include "esp_zb_light.h"
 #include "mhz19b_driver.h"
 #include "sps30_driver.h"
+#include "ssd1306_display.h"
 #include "zcl/esp_zigbee_zcl_pm2_5_measurement.h"
 
 #if !defined ZB_ED_ROLE
@@ -71,6 +72,11 @@ static float s_pm25_tolerance = 10.0f;            // 10 ug/m3 tolerance
 
 /* Flag to indicate Zigbee is ready for attribute updates */
 static volatile bool s_zigbee_ready = false;
+
+/* Latest sensor values for display */
+static uint16_t s_latest_co2_ppm = 0;
+static float s_latest_pm2_5 = 0.0f / 0.0f;  /* NaN = invalid */
+static SemaphoreHandle_t s_sensor_data_mutex = NULL;
 
 /********************* LED Functions **************************/
 static void blink_led(int times, uint32_t on_time_ms, uint32_t off_time_ms)
@@ -264,6 +270,12 @@ static void co2_sensor_task(void *pvParameter)
         if (err == ESP_OK && reading.valid) {
             ESP_LOGI(TAG, "CO2 reading: %u ppm", reading.co2_ppm);
 
+            // Store latest value for display
+            if (xSemaphoreTake(s_sensor_data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                s_latest_co2_ppm = reading.co2_ppm;
+                xSemaphoreGive(s_sensor_data_mutex);
+            }
+
             // Update the static variable and report via Zigbee
             if (esp_zb_lock_acquire(pdMS_TO_TICKS(1000))) {
                 /* Convert ppm to ZCL float value (0.0 - 1.0 range) */
@@ -284,6 +296,14 @@ static void co2_sensor_task(void *pvParameter)
             } else {
                 ESP_LOGW(TAG, "Failed to acquire Zigbee lock for CO2 reporting");
             }
+
+            // Update display with latest values
+            float pm2_5_display = 0.0f / 0.0f;
+            if (xSemaphoreTake(s_sensor_data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                pm2_5_display = s_latest_pm2_5;
+                xSemaphoreGive(s_sensor_data_mutex);
+            }
+            ssd1306_display_update(reading.co2_ppm, pm2_5_display);
         } else {
             ESP_LOGW(TAG, "CO2 sensor read failed: %s", mhz19b_err_to_str(reading.error));
 
@@ -384,6 +404,12 @@ static void pm25_sensor_task(void *pvParameter)
         if (err == ESP_OK && reading.valid) {
             ESP_LOGI(TAG, "PM2.5 reading: %.2f ug/m3", reading.pm2_5);
 
+            // Store latest value for display
+            if (xSemaphoreTake(s_sensor_data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                s_latest_pm2_5 = reading.pm2_5;
+                xSemaphoreGive(s_sensor_data_mutex);
+            }
+
             // Update the static variable and report via Zigbee
             if (esp_zb_lock_acquire(pdMS_TO_TICKS(1000))) {
                 // Use raw value for PM2.5 cluster (Home Assistant expects ug/m3 directly)
@@ -411,6 +437,14 @@ static void pm25_sensor_task(void *pvParameter)
             } else {
                 ESP_LOGW(TAG, "Failed to acquire Zigbee lock for PM2.5 reporting");
             }
+
+            // Update display with latest values
+            uint16_t co2_ppm_display = 0;
+            if (xSemaphoreTake(s_sensor_data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                co2_ppm_display = s_latest_co2_ppm;
+                xSemaphoreGive(s_sensor_data_mutex);
+            }
+            ssd1306_display_update(co2_ppm_display, reading.pm2_5);
         } else {
             ESP_LOGW(TAG, "PM2.5 sensor read failed: %s", sps30_err_to_str(reading.error));
 
@@ -722,6 +756,15 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_zb_platform_config(&config));
+
+    // Create mutex for sensor data sharing
+    s_sensor_data_mutex = xSemaphoreCreateMutex();
+
+    // Display setup (non-critical - continues if display not connected)
+    esp_err_t display_err = ssd1306_display_init();
+    if (display_err != ESP_OK) {
+        ESP_LOGW(TAG, "Display initialization failed, continuing without display");
+    }
 
     // Button setup
     gpio_config_t io_conf = {
