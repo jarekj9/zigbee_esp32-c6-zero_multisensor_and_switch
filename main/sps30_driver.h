@@ -18,8 +18,8 @@ extern "C" {
 
 /* SPS30 I2C Configuration */
 #define SPS30_I2C_NUM           I2C_NUM_0
-#define SPS30_I2C_SDA_PIN       22
-#define SPS30_I2C_SCL_PIN       21
+#define SPS30_I2C_SDA_PIN       21
+#define SPS30_I2C_SCL_PIN       22
 #define SPS30_I2C_FREQ_HZ       50000   // Use 50kHz for better stability with clock stretching
 #define SPS30_I2C_ADDR          0x69
 #define SPS30_I2C_ADDR_ALT      0x68    // Alternate address (some variants)
