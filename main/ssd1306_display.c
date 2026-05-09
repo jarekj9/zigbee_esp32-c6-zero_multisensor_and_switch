@@ -47,6 +47,7 @@ static const char *TAG = "SSD1306_DISPLAY";
 #define SSD1306_CONTROL_CMD         0x00
 #define SSD1306_CONTROL_DATA        0x40
 
+static bool s_always_on = false;
 static bool s_display_available = false;
 static TaskHandle_t s_display_task_handle = NULL;
 static SemaphoreHandle_t s_i2c_mutex = NULL;
@@ -317,7 +318,7 @@ esp_err_t ssd1306_display_init(void)
     ssd1306_write_command(0x12);
 
     ssd1306_write_command(SSD1306_CMD_SET_CONTRAST);
-    ssd1306_write_command(0xCF);
+    ssd1306_write_command(0x01);
 
     ssd1306_write_command(SSD1306_CMD_SET_PRECHARGE);
     ssd1306_write_command(0xF1);
@@ -325,19 +326,34 @@ esp_err_t ssd1306_display_init(void)
     ssd1306_write_command(SSD1306_CMD_SET_VCOM_DETECT);
     ssd1306_write_command(0x40);
 
-    ssd1306_write_command(SSD1306_CMD_DISPLAY_ON);
-
-    /* Clear framebuffer */
+    /* FIX: Clear GDDRAM BEFORE turning display on */
+    ssd1306_write_command(SSD1306_CMD_SET_COL_ADDR);
+    ssd1306_write_command(0);
+    ssd1306_write_command(SSD1306_WIDTH - 1);
+    ssd1306_write_command(SSD1306_CMD_SET_PAGE_ADDR);
+    ssd1306_write_command(0);
+    ssd1306_write_command(SSD1306_PAGES - 1);
     memset(s_framebuffer, 0, sizeof(s_framebuffer));
+    for (int page = 0; page < SSD1306_PAGES; page++) {
+        ssd1306_write_data(s_framebuffer[page], SSD1306_WIDTH);
+    }
 
-    /* Display initial message */
-    draw_string(30, 3, "Ready");
-    ssd1306_refresh_display();
+    /* FIX: Turn on AFTER clear */
+    ssd1306_write_command(SSD1306_CMD_DISPLAY_ON);
     vTaskDelay(pdMS_TO_TICKS(500));
-    ssd1306_display_clear();
+
+    /* FIX: s_display_available = true BEFORE calling ssd1306_refresh_display() */
+    s_display_available = true;
+
+    draw_string(2, 1, "ZIGBEE SENSOR");
+    draw_string(2, 3, "- Initializing");
+    draw_string(2, 4, "- Wait a minute");
+    draw_string(2, 5, "- Button 5s-press");
+    draw_string(2, 6, "  for factory reset");
+
+    ssd1306_refresh_display();
 
     ESP_LOGI(TAG, "SSD1306 display initialized successfully at 0x%02X", s_display_addr);
-    s_display_available = true;
 
     /* Create display task */
     xTaskCreate(ssd1306_display_task, "display_task", 4096, NULL, 5, &s_display_task_handle);
@@ -559,33 +575,28 @@ static void update_display_content(void)
         xSemaphoreGive(s_data_mutex);
     }
 
-    co2_valid = (co2_ppm > 0 && co2_ppm < 5000);
+    co2_valid  = (co2_ppm > 0 && co2_ppm < 5000);
     pm25_valid = (!isnan(pm2_5) && pm2_5 >= 0.0f && pm2_5 < 1000.0f);
 
     memset(s_framebuffer, 0, sizeof(s_framebuffer));
 
-    // Row 0: small header
-    draw_string(28, 0, "Air Quality");
-    draw_hline(0, 10, 128);
+    char line[20];
 
-    // Row 1-2: CO2 in 2x font (pages 2-3)
-    char line[16];
+    draw_string(84, 0, "CO2 ppm");
     if (co2_valid)
-        snprintf(line, sizeof(line), "%u ppm", co2_ppm);
+        snprintf(line, sizeof(line), "%u", co2_ppm);
     else
-        snprintf(line, sizeof(line), "--- ppm");
-    draw_string(0, 1, "CO2:");           // small label, page 1
-    draw_string_2x(0, 2, line);          // big value, pages 2-3
+        snprintf(line, sizeof(line), "---");
+    draw_string_2x(0, 1, line);
 
-    draw_hline(0, 33, 128);
+    draw_hline(0, 28, 128);
 
-    // Row 2: PM2.5 in 2x font (pages 5-6)
+    draw_string(60, 4, "PM2.5 ug/m3");
     if (pm25_valid)
-        snprintf(line, sizeof(line), "%.1f ug/m3", pm2_5);
+        snprintf(line, sizeof(line), "%u", (uint16_t)pm2_5);
     else
-        snprintf(line, sizeof(line), "--- ug/m3");
-    draw_string(0, 4, "PM2.5:");         // small label, page 4
-    draw_string_2x(0, 5, line);          // big value, pages 5-6
+        snprintf(line, sizeof(line), "---");
+    draw_string_2x(0, 5, line);
 
     ssd1306_refresh_display();
 }
@@ -619,14 +630,22 @@ void ssd1306_display_update(uint16_t co2_ppm, float pm2_5)
         ESP_LOGI(TAG, "Display updated - CO2:%u ppm, PM2.5:%.1f ug/m3", co2_ppm, pm2_5);
 
     static TimerHandle_t s_off_timer = NULL;
-    if (s_off_timer == NULL) {
-        s_off_timer = xTimerCreate("disp_off", pdMS_TO_TICKS(SSD1306_DISPLAY_TIME_MS),
-                                   pdFALSE, NULL,
-                                   (TimerCallbackFunction_t)ssd1306_display_off);
-    }
-    if (s_off_timer != NULL) {
-        xTimerStop(s_off_timer, 0);
-        xTimerStart(s_off_timer, 0);
+
+    if (!s_always_on) {
+        if (s_off_timer == NULL) {
+            s_off_timer = xTimerCreate("disp_off", pdMS_TO_TICKS(SSD1306_DISPLAY_TIME_MS),
+                                       pdFALSE, NULL,
+                                       (TimerCallbackFunction_t)ssd1306_display_off);
+        }
+        if (s_off_timer != NULL) {
+            xTimerStop(s_off_timer, 0);
+            xTimerStart(s_off_timer, 0);
+        }
+    } else {
+        // Cancel pending off timer if always-on was just enabled mid-countdown
+        if (s_off_timer != NULL) {
+            xTimerStop(s_off_timer, 0);
+        }
     }
 }
 
@@ -677,4 +696,14 @@ void ssd1306_display_clear(void)
 
     memset(s_framebuffer, 0, sizeof(s_framebuffer));
     ssd1306_refresh_display();
+}
+
+void ssd1306_display_set_always_on(bool enable)
+{
+    s_always_on = enable;
+    if (enable) {
+        ssd1306_display_on();
+    } else {
+        ssd1306_display_off();
+    }
 }

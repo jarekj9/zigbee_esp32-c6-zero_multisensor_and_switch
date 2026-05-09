@@ -78,6 +78,10 @@ static uint16_t s_latest_co2_ppm = 0;
 static float s_latest_pm2_5 = 0.0f / 0.0f;  /* NaN = invalid */
 static SemaphoreHandle_t s_sensor_data_mutex = NULL;
 
+// Declarations:
+void ssd1306_display_set_always_on(bool enable);
+
+
 /********************* LED Functions **************************/
 static void blink_led(int times, uint32_t on_time_ms, uint32_t off_time_ms)
 {
@@ -169,36 +173,36 @@ static void IRAM_ATTR button_isr_handler(void* arg)
 static void button_task(void *pvParameter)
 {
     static TickType_t last_rejoin_time = 0;
-    
+    static bool s_display_always_on = false;
+
     while(1) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        
+
         TickType_t press_start = xTaskGetTickCount();
         vTaskDelay(pdMS_TO_TICKS(100));
-        
+
         while(gpio_get_level(BUTTON_GPIO) == 1) {
             vTaskDelay(pdMS_TO_TICKS(100));
         }
-        
+
         TickType_t press_duration = xTaskGetTickCount() - press_start;
         uint32_t press_ms = pdTICKS_TO_MS(press_duration);
-        
+
         if(press_ms >= 5000) {
             ESP_LOGW(TAG, "Factory reset triggered");
             blink_led(5, 100, 100);
             esp_zb_factory_reset();
-            
-            
+
         } else if(press_ms >= 500) {
             TickType_t current_time = xTaskGetTickCount();
-            
+
             if ((current_time - last_rejoin_time) > pdMS_TO_TICKS(REJOIN_COOLDOWN_MS)) {
                 ESP_LOGI(TAG, "Button pressed - triggering rejoin");
-                
+
                 esp_zb_lock_acquire(portMAX_DELAY);
                 esp_err_t err = esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
                 esp_zb_lock_release();
-                
+
                 if (err == ESP_OK) {
                     last_rejoin_time = current_time;
                     ESP_LOGI(TAG, "Rejoin initiated successfully");
@@ -209,8 +213,19 @@ static void button_task(void *pvParameter)
             } else {
                 ESP_LOGI(TAG, "Button ignored - cooldown active");
             }
+
         } else {
-            ESP_LOGD(TAG, "False trigger - noise detected");
+            // Short press: toggle display always-on
+            s_display_always_on = !s_display_always_on;
+            ESP_LOGI(TAG, "Display always-on: %s", s_display_always_on ? "ON" : "OFF");
+
+            if (s_display_always_on) {
+                ssd1306_display_set_always_on(true);
+                blink_led(1, 200, 0);
+            } else {
+                ssd1306_display_set_always_on(false);
+                blink_led(2, 100, 100);
+            }
         }
     }
 }
@@ -474,7 +489,7 @@ static void pm25_sensor_task(void *pvParameter)
                 co2_ppm_display = s_latest_co2_ppm;
                 xSemaphoreGive(s_sensor_data_mutex);
             }
-            ssd1306_display_update(co2_ppm_display, pm25_avg);
+            // ssd1306_display_update(co2_ppm_display, pm25_avg); // another screen flash after fan stops
         } else {
             ESP_LOGW(TAG, "PM2.5 sensor read failed: %s", sps30_err_to_str(reading.error));
 
