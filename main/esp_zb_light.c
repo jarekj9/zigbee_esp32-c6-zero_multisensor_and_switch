@@ -372,7 +372,7 @@ static void pm25_sensor_task(void *pvParameter)
         // Only read sensor if Zigbee is ready and sensor is available
         if (!s_zigbee_ready) {
             vTaskDelay(pdMS_TO_TICKS(1000));
-            last_wake_time = xTaskGetTickCount();  // Reset after delay
+            last_wake_time = xTaskGetTickCount();
             continue;
         }
 
@@ -394,45 +394,75 @@ static void pm25_sensor_task(void *pvParameter)
             continue;
         }
 
-        // Wait for fan to stabilize (datasheet says ~10 seconds for accurate readings)
+        // Wait for fan to stabilize
         ESP_LOGI(TAG, "Waiting for SPS30 fan to stabilize...");
-        vTaskDelay(pdMS_TO_TICKS(10000));
+        vTaskDelay(pdMS_TO_TICKS(15000));
 
-        // Read measurement
-        err = sps30_read_measurement(&reading);
+        // Collect multiple samples and average them
+        const int NUM_SAMPLES = 5;
+        float samples[NUM_SAMPLES];
+        int valid_count = 0;
 
-        if (err == ESP_OK && reading.valid) {
-            ESP_LOGI(TAG, "PM2.5 reading: %.2f ug/m3", reading.pm2_5);
+        for (int i = 0; i < NUM_SAMPLES; i++) {
+            err = sps30_read_measurement(&reading);
+            if (err == ESP_OK && reading.valid) {
+                samples[valid_count++] = reading.pm2_5;
+                ESP_LOGD(TAG, "PM2.5 sample %d: %.2f ug/m3", i + 1, reading.pm2_5);
+            }
+            if (i < NUM_SAMPLES - 1) {
+                vTaskDelay(pdMS_TO_TICKS(1000)); // SPS30 outputs at ~1Hz
+            }
+        }
 
+        // Calculate averaged value with outlier rejection (drop min and max if >= 3 valid)
+        float pm25_avg = 0.0f / 0.0f; // NaN = invalid
+        if (valid_count >= 3) {
+            float min_val = samples[0], max_val = samples[0], sum = 0.0f;
+            for (int i = 0; i < valid_count; i++) {
+                if (samples[i] < min_val) min_val = samples[i];
+                if (samples[i] > max_val) max_val = samples[i];
+                sum += samples[i];
+            }
+            // Drop min and max, average the rest
+            sum -= min_val + max_val;
+            pm25_avg = sum / (valid_count - 2);
+            ESP_LOGI(TAG, "PM2.5 averaged: %.2f ug/m3 (from %d samples, dropped min=%.2f max=%.2f)",
+                     pm25_avg, valid_count, min_val, max_val);
+        } else if (valid_count > 0) {
+            // Not enough for outlier rejection, plain average
+            float sum = 0.0f;
+            for (int i = 0; i < valid_count; i++) sum += samples[i];
+            pm25_avg = sum / valid_count;
+            ESP_LOGI(TAG, "PM2.5 averaged: %.2f ug/m3 (from %d samples, no outlier rejection)",
+                     pm25_avg, valid_count);
+        }
+
+        if (valid_count > 0) {
             // Store latest value for display
             if (xSemaphoreTake(s_sensor_data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                s_latest_pm2_5 = reading.pm2_5;
+                s_latest_pm2_5 = pm25_avg;
                 xSemaphoreGive(s_sensor_data_mutex);
             }
 
             // Update the static variable and report via Zigbee
             if (esp_zb_lock_acquire(pdMS_TO_TICKS(1000))) {
-                // Use raw value for PM2.5 cluster (Home Assistant expects ug/m3 directly)
-                s_pm25_measured_value = reading.pm2_5;
+                s_pm25_measured_value = pm25_avg;
 
-                ESP_LOGI(TAG, "Setting PM2.5 attribute to %.2f ug/m3 (endpoint %d)", 
+                ESP_LOGI(TAG, "Setting PM2.5 attribute to %.2f ug/m3 (endpoint %d)",
                          s_pm25_measured_value, HA_ESP_PM25_SENSOR_ENDPOINT);
 
-                // Set PM2.5 Measurement cluster attribute (raw ug/m3)
                 esp_err_t set_err = esp_zb_zcl_set_attribute_val(HA_ESP_PM25_SENSOR_ENDPOINT,
                                               ESP_ZB_ZCL_CLUSTER_ID_PM2_5_MEASUREMENT,
                                               ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
                                               ESP_ZB_ZCL_ATTR_PM2_5_MEASUREMENT_MEASURED_VALUE_ID,
                                               &s_pm25_measured_value,
                                               false);
-                
+
                 if (set_err != ESP_OK) {
                     ESP_LOGW(TAG, "Failed to set PM2.5 attribute: %s", esp_err_to_name(set_err));
                 }
 
-                /* Send explicit report to coordinator */
-                pm25_send_report(reading.pm2_5);
-
+                pm25_send_report(pm25_avg);
                 esp_zb_lock_release();
             } else {
                 ESP_LOGW(TAG, "Failed to acquire Zigbee lock for PM2.5 reporting");
@@ -444,13 +474,13 @@ static void pm25_sensor_task(void *pvParameter)
                 co2_ppm_display = s_latest_co2_ppm;
                 xSemaphoreGive(s_sensor_data_mutex);
             }
-            ssd1306_display_update(co2_ppm_display, reading.pm2_5);
+            ssd1306_display_update(co2_ppm_display, pm25_avg);
         } else {
             ESP_LOGW(TAG, "PM2.5 sensor read failed: %s", sps30_err_to_str(reading.error));
 
             // Report invalid value (unavailable - NaN)
             if (esp_zb_lock_acquire(pdMS_TO_TICKS(1000))) {
-                s_pm25_measured_value = 0.0f / 0.0f;  /* NaN = invalid */
+                s_pm25_measured_value = 0.0f / 0.0f;
 
                 esp_zb_zcl_set_attribute_val(HA_ESP_PM25_SENSOR_ENDPOINT,
                                               ESP_ZB_ZCL_CLUSTER_ID_PM2_5_MEASUREMENT,
@@ -459,14 +489,12 @@ static void pm25_sensor_task(void *pvParameter)
                                               &s_pm25_measured_value,
                                               false);
 
-                /* Send explicit report to coordinator */
                 pm25_send_report(0.0f / 0.0f);
-
                 esp_zb_lock_release();
             }
         }
 
-        // Stop measurement to turn off fan (save power and extend fan life)
+        // Stop measurement to turn off fan
         sps30_stop_measurement();
         ESP_LOGI(TAG, "SPS30 measurement stopped, fan off");
 

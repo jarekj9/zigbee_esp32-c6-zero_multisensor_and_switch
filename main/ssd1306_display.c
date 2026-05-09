@@ -513,6 +513,39 @@ static void ssd1306_refresh_display(void)
     xSemaphoreGive(s_i2c_mutex);
 }
 
+static void draw_char_2x(int x, int y_page, char c)
+{
+    if (c < 32 || c > 126) c = '?';
+    const uint8_t *char_data = font_5x7[c - 32];
+
+    for (int col = 0; col < 5; col++) {
+        uint8_t col_data = char_data[col];
+        // Expand 8 bits → 16 bits (each bit doubled vertically)
+        uint16_t expanded = 0;
+        for (int bit = 0; bit < 8; bit++) {
+            if (col_data & (1 << bit)) {
+                expanded |= (3 << (bit * 2));
+            }
+        }
+        // Write 2 pages, 2 pixels wide per column
+        int px = x + col * 2;
+        if (px + 1 >= SSD1306_WIDTH) break;
+        if (y_page < SSD1306_PAGES)
+            s_framebuffer[y_page][px] = s_framebuffer[y_page][px + 1] = (uint8_t)(expanded & 0xFF);
+        if (y_page + 1 < SSD1306_PAGES)
+            s_framebuffer[y_page + 1][px] = s_framebuffer[y_page + 1][px + 1] = (uint8_t)(expanded >> 8);
+    }
+}
+
+static void draw_string_2x(int x, int y_page, const char *str)
+{
+    while (*str && x < SSD1306_WIDTH - 10) {
+        draw_char_2x(x, y_page, *str);
+        x += 11; // 5 cols * 2px + 1px spacing
+        str++;
+    }
+}
+
 static void update_display_content(void)
 {
     uint16_t co2_ppm = 0;
@@ -531,27 +564,28 @@ static void update_display_content(void)
 
     memset(s_framebuffer, 0, sizeof(s_framebuffer));
 
-    draw_string(20, 0, "Air Quality");
+    // Row 0: small header
+    draw_string(28, 0, "Air Quality");
     draw_hline(0, 10, 128);
 
-    char line[20];
-    if (co2_valid) {
-        snprintf(line, sizeof(line), "CO2: %4u ppm", co2_ppm);
-    } else {
-        snprintf(line, sizeof(line), "CO2:  --- ppm");
-    }
-    draw_string(0, 2, line);
+    // Row 1-2: CO2 in 2x font (pages 2-3)
+    char line[16];
+    if (co2_valid)
+        snprintf(line, sizeof(line), "%u ppm", co2_ppm);
+    else
+        snprintf(line, sizeof(line), "--- ppm");
+    draw_string(0, 1, "CO2:");           // small label, page 1
+    draw_string_2x(0, 2, line);          // big value, pages 2-3
 
-    if (pm25_valid) {
-        snprintf(line, sizeof(line), "PM2.5: %5.1f", pm2_5);
-    } else {
-        snprintf(line, sizeof(line), "PM2.5:   ---");
-    }
-    draw_string(0, 4, line);
-    draw_string(0, 5, "ug/m3");
+    draw_hline(0, 33, 128);
 
-    draw_hline(0, 54, 128);
-    draw_string(8, 7, "Zigbee Sensor");
+    // Row 2: PM2.5 in 2x font (pages 5-6)
+    if (pm25_valid)
+        snprintf(line, sizeof(line), "%.1f ug/m3", pm2_5);
+    else
+        snprintf(line, sizeof(line), "--- ug/m3");
+    draw_string(0, 4, "PM2.5:");         // small label, page 4
+    draw_string_2x(0, 5, line);          // big value, pages 5-6
 
     ssd1306_refresh_display();
 }
@@ -572,14 +606,17 @@ void ssd1306_display_update(uint16_t co2_ppm, float pm2_5)
 
     if (xSemaphoreTake(s_data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         s_last_co2_ppm = co2_ppm;
-        s_last_pm2_5 = pm2_5;
+        s_last_pm2_5 = isnan(pm2_5) ? (0.0f / 0.0f) : pm2_5;
         xSemaphoreGive(s_data_mutex);
     }
 
     ssd1306_display_on();
     update_display_content();
 
-    ESP_LOGI(TAG, "Display updated - CO2:%u ppm, PM2.5:%.1f ug/m3", co2_ppm, pm2_5);
+    if (co2_ppm == 0 && isnan(pm2_5))
+        ESP_LOGI(TAG, "Display updated - no data yet");
+    else
+        ESP_LOGI(TAG, "Display updated - CO2:%u ppm, PM2.5:%.1f ug/m3", co2_ppm, pm2_5);
 
     static TimerHandle_t s_off_timer = NULL;
     if (s_off_timer == NULL) {
