@@ -1,67 +1,82 @@
-| Supported Targets | ESP32-C6 | ESP32-H2 |
-| ----------------- | -------- | -------- |
+# ESP32-C6 Zigbee Multi-Sensor Device
 
-# Light Bulb Example
+## Overview
+Zigbee End Device (ED) based on ESP32-C6-Zero with CO2 and PM2.5 sensors, OLED display, button controls, and sound output via Zigbee on/off commands.
 
-This test code shows how to configure Zigbee end device and use it as HA on/off light bulb.
+## Hardware
+- **Sensors:**
+  - MHZ19B (UART) - CO2 measurement, 9600 baud
+  - SPS30 (I2C) - PM2.5 & PM1.0 mass concentration
+  - SSD1306 (I2C) - 128x64 OLED display
+- **Actuators:**
+  - Buzzer (GPIO20, LEDC) - Melody playback via Zigbee on/off
+  - RGB LED (via led_strip driver) - Status indication
+- **Input:**
+  - Button (GPIO2, debounced 500ms, pull-up) - 3 functions
 
-The ESP Zigbee SDK provides more examples and tools for productization:
-* [ESP Zigbee SDK Docs](https://docs.espressif.com/projects/esp-zigbee-sdk)
-* [ESP Zigbee SDK Repo](https://github.com/espressif/esp-zigbee-sdk)
+## Zigbee Configuration
+| Endpoint | Device Type | Cluster | Function |
+|----------|-------------|---------|----------|
+| 10 | HA Light | On/Off | Buzzer control (plays melody) |
+| 11 | CO2 Sensor | Carbon Dioxide Measurement | CO2 reporting (60s interval) |
+| 12 | PM2.5 Sensor | PM2.5 Measurement | PM2.5 reporting (120s interval) |
 
-## Hardware Required
+Cluster attributes use standard ZCL: CO2 normalized to 0.0-1.0 (ppm/1000000), PM2.5 in µg/m³.
 
-* One development board with ESP32-H2 SoC acting as Zigbee end-device (loaded with HA_on_off_light example)
-* A USB cable for power supply and programming
-* Choose another ESP32-H2 as Zigbee coordinator (see [HA_on_off_switch example](../HA_on_off_switch))
+## Pin Configuration
+| GPIO | Function | Notes |
+|------|----------|-------|
+| 1,3 | MHZ19B UART | TX/RX |
+| 14,15 | SSD1306 I2C | SDA/SCL (I2C_NUM_0) |
+| 21,22 | SPS30 I2C | SDA/SCL (I2C_NUM_0, shared) |
+| 2 | Button | Active low, debounced |
+| 20 | Buzzer | LEDC PWM output |
 
-## Configure the project
+## Core Functions
 
-Before project configuration and build, make sure to set the correct chip target using `idf.py --preview set-target TARGET` command.
+### Button Control (Interrupt + Task)
+- **Short press (<500ms):** Toggle display always-on mode
+- **Medium press (500ms-5s):** Trigger Zigbee network rejoin (5s cooldown)
+- **Long press (≥5s):** Factory reset & LED blink pattern
 
-## Erase the NVRAM
+### Buzzer (LEDC + Task Notification)
+- **API:** `buzzer_play_melody_async()` - Plays video game style melody
+- Task-based; triggered via task notification on Zigbee on/off commands
+- Single melody with note frequencies defined (E5, C5, G5, etc.)
 
-Before flash it to the board, it is recommended to erase NVRAM if user doesn't want to keep the previous examples or other projects stored info using `idf.py -p PORT erase-flash`
+### Sensors (Periodic Tasks)
+- **CO2 Task:** Reads MHZ19B every 60s, updates attribute, sends ZCL report
+- **PM2.5 Task:** Reads SPS30 every 120s, updates attribute, sends ZCL report
+- Both tasks wait for Zigbee ready flag before reading
+- Thread-safe sensor data storage via mutex
 
-## Build and Flash
+### Display (I2C)
+- **API:** `ssd1306_display_update(co2_ppm, pm2_5)` - Updates display with current readings
+- Auto-off after 5s (configurable via `ssd1306_display_set_always_on()`)
+- Dual I2C bus (shared with SPS30 at I2C_NUM_0)
 
-Build the project, flash it to the board, and start the monitor tool to view the serial output by running `idf.py -p PORT flash monitor`.
+### LED Blink Status
+- `blink_led(times, on_ms, off_ms)` - Synchronous blink pattern
+- Used for button feedback and network events
 
-(To exit the serial monitor, type ``Ctrl-]``.)
+## FreeRTOS Tasks
+1. **button_task** - Debounce handler, network steering, factory reset
+2. **buzzer_task** - Melody playback (notification-driven)
+3. **co2_sensor_task** - CO2 periodic reading & Zigbee reporting
+4. **pm25_sensor_task** - PM2.5 periodic reading & Zigbee reporting
 
-## Example Output
+## Key Synchronization
+- `s_zigbee_ready` flag - Prevents sensor reads before network join
+- `s_sensor_data_mutex` - Protects latest sensor values for display
+- `esp_zb_lock_acquire/release` - Zigbee stack thread safety
 
-As you run the example, you will see the following log:
-
+## Build
+```bash
+idf.py set-target esp32c6
+idf.py menuconfig  # Ensure ZB_ED_ROLE is defined
+idf.py build
+idf.py flash
 ```
-I (403) app_start: Starting scheduler on CPU0
-I (408) main_task: Started on CPU0
-I (408) main_task: Calling app_main()
-I (428) phy: phy_version: 230,2, 9aae6ea, Jan 15 2024, 11:17:12
-I (428) phy: libbtbb version: 944f18e, Jan 15 2024, 11:17:25
-I (438) main_task: Returned from app_main()
-I (548) ESP_ZB_ON_OFF_LIGHT: ZDO signal: ZDO Config Ready (0x17), status: ESP_FAIL
-I (548) ESP_ZB_ON_OFF_LIGHT: Initialize Zigbee stack
-W (548) rmt: channel resolution loss, real=10666666
-I (558) gpio: GPIO[8]| InputEn: 0| OutputEn: 1| OpenDrain: 0| Pullup: 1| Pulldown: 0| Intr:0 
-I (548) ESP_ZB_ON_OFF_LIGHT: Deferred driver initialization successful
-I (568) ESP_ZB_ON_OFF_LIGHT: Device started up in  factory-reset mode
-I (578) ESP_ZB_ON_OFF_LIGHT: Start network steering
-I (3558) ESP_ZB_ON_OFF_LIGHT: Joined network successfully (Extended PAN ID: 74:4d:bd:ff:fe:63:f7:30, PAN ID: 0x13af, Channel:13, Short Address: 0x7c16)
-I (10238) ESP_ZB_ON_OFF_LIGHT: Received message: endpoint(10), cluster(0x6), attribute(0x0), data size(1)
-I (10238) ESP_ZB_ON_OFF_LIGHT: Light sets to On
-I (10798) ESP_ZB_ON_OFF_LIGHT: Received message: endpoint(10), cluster(0x6), attribute(0x0), data size(1)
-I (10798) ESP_ZB_ON_OFF_LIGHT: Light sets to Off
-I (11228) ESP_ZB_ON_OFF_LIGHT: Received message: endpoint(10), cluster(0x6), attribute(0x0), data size(1)
-I (11228) ESP_ZB_ON_OFF_LIGHT: Light sets to On
-I (11618) ESP_ZB_ON_OFF_LIGHT: Received message: endpoint(10), cluster(0x6), attribute(0x0), data size(1)
-I (11618) ESP_ZB_ON_OFF_LIGHT: Light sets to Off
-```
 
-## Light Control Functions
-
- * By toggling the switch button (BOOT) on the ESP32-H2 board loaded with the `HA_on_off_switch` example, the LED on this board loaded with `HA_on_off_light` example will be on and off.
-
-## Troubleshooting
-
-For any technical queries, please open an [issue](https://github.com/espressif/esp-idf/issues) on GitHub. We will get back to you soon.
+## Main Entry Point
+`esp_zb_light.c` - Initializes all peripherals (GPIO, UART, I2C, LEDC), Zigbee stack, endpoints, and starts FreeRTOS tasks.
