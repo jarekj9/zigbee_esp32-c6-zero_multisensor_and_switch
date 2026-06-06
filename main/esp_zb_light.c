@@ -81,6 +81,18 @@ static SemaphoreHandle_t s_sensor_data_mutex = NULL;
 // Declarations:
 void ssd1306_display_set_always_on(bool enable);
 
+/* Helper: read latest sensor values from mutex and refresh display */
+static void refresh_display(void)
+{
+    uint16_t co2 = 0;
+    float pm25 = 0.0f / 0.0f;
+    if (xSemaphoreTake(s_sensor_data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        co2 = s_latest_co2_ppm;
+        pm25 = s_latest_pm2_5;
+        xSemaphoreGive(s_sensor_data_mutex);
+    }
+    ssd1306_display_update(co2, pm25);
+}
 
 /********************* LED Functions **************************/
 static void blink_led(int times, uint32_t on_time_ms, uint32_t off_time_ms)
@@ -272,9 +284,18 @@ static void co2_sensor_task(void *pvParameter)
 
     ESP_LOGI(TAG, "CO2 sensor task started, reporting every %d seconds", CO2_REPORTING_INTERVAL_SEC);
 
+    /* Counter to update display periodically even when Zigbee not ready */
+    uint32_t display_counter = 0;
+
     while (1) {
         // Only read sensor if Zigbee is ready
         if (!s_zigbee_ready) {
+            /* Update display periodically so "Initializing" doesn't stay forever */
+            display_counter++;
+            if (display_counter >= CO2_REPORTING_INTERVAL_SEC) {
+                display_counter = 0;
+                refresh_display(); // Shows last known values while waiting
+            }
             vTaskDelay(pdMS_TO_TICKS(1000));
             last_wake_time = xTaskGetTickCount();  // Reset after delay
             continue;
@@ -313,12 +334,7 @@ static void co2_sensor_task(void *pvParameter)
             }
 
             // Update display with latest values
-            float pm2_5_display = 0.0f / 0.0f;
-            if (xSemaphoreTake(s_sensor_data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                pm2_5_display = s_latest_pm2_5;
-                xSemaphoreGive(s_sensor_data_mutex);
-            }
-            ssd1306_display_update(reading.co2_ppm, pm2_5_display);
+            refresh_display();
         } else {
             ESP_LOGW(TAG, "CO2 sensor read failed: %s", mhz19b_err_to_str(reading.error));
 
@@ -338,6 +354,9 @@ static void co2_sensor_task(void *pvParameter)
 
                 esp_zb_lock_release();
             }
+
+            /* Still update the display with last known values so it doesn't freeze */
+            refresh_display();
         }
 
         // Wait for next interval
@@ -383,9 +402,17 @@ static void pm25_sensor_task(void *pvParameter)
 
     ESP_LOGI(TAG, "PM2.5 sensor task started, reporting every %d seconds", PM25_REPORTING_INTERVAL_SEC);
 
+    uint32_t display_counter = 0;
+
     while (1) {
         // Only read sensor if Zigbee is ready and sensor is available
         if (!s_zigbee_ready) {
+            /* Update display periodically so "Initializing" doesn't stay forever */
+            display_counter++;
+            if (display_counter >= PM25_REPORTING_INTERVAL_SEC) {
+                display_counter = 0;
+                refresh_display(); // Shows last known values while waiting
+            }
             vTaskDelay(pdMS_TO_TICKS(1000));
             last_wake_time = xTaskGetTickCount();
             continue;
@@ -484,12 +511,7 @@ static void pm25_sensor_task(void *pvParameter)
             }
 
             // Update display with latest values
-            uint16_t co2_ppm_display = 0;
-            if (xSemaphoreTake(s_sensor_data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                co2_ppm_display = s_latest_co2_ppm;
-                xSemaphoreGive(s_sensor_data_mutex);
-            }
-            // ssd1306_display_update(co2_ppm_display, pm25_avg); // another screen flash after fan stops
+            refresh_display();
         } else {
             ESP_LOGW(TAG, "PM2.5 sensor read failed: %s", sps30_err_to_str(reading.error));
 
@@ -507,6 +529,9 @@ static void pm25_sensor_task(void *pvParameter)
                 pm25_send_report(0.0f / 0.0f);
                 esp_zb_lock_release();
             }
+
+            /* Still update display with last known values */
+            refresh_display();
         }
 
         // Stop measurement to turn off fan
@@ -565,6 +590,13 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             ESP_LOGI(TAG, "Network steering was not successful (status: %s)", esp_err_to_name(err_status));
             esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb, ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
         }
+        break;
+    case ESP_ZB_ZDO_SIGNAL_LEAVE:
+        ESP_LOGW(TAG, "Device left the network (status: %s)", esp_err_to_name(err_status));
+        s_zigbee_ready = false;
+        /* Schedule rejoin after a short delay */
+        esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb,
+                               ESP_ZB_BDB_MODE_NETWORK_STEERING, 5000);
         break;
     default:
         ESP_LOGI(TAG, "ZDO signal: %s (0x%x), status: %s", esp_zb_zdo_signal_to_string(sig_type), sig_type, esp_err_to_name(err_status));
