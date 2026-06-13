@@ -35,6 +35,7 @@
 #define BUZZER_TIMER LEDC_TIMER_1
 #define BUTTON_DEBOUNCE_MS 500
 #define REJOIN_COOLDOWN_MS 5000
+#define REJOIN_AFTER_FAILURES 5   /* Auto-rejoin after N consecutive report failures */
 
 // Note frequencies in Hz
 #define NOTE_E5  659
@@ -77,6 +78,11 @@ static volatile bool s_zigbee_ready = false;
 static uint16_t s_latest_co2_ppm = 0;
 static float s_latest_pm2_5 = 0.0f / 0.0f;  /* NaN = invalid */
 static SemaphoreHandle_t s_sensor_data_mutex = NULL;
+
+/* Consecutive Zigbee report failure counters (auto-rejoin watchdog) */
+static uint8_t s_co2_report_failures = 0;
+static uint8_t s_pm25_report_failures = 0;
+static TickType_t s_last_auto_rejoin_time = 0;
 
 // Declarations:
 void ssd1306_display_set_always_on(bool enable);
@@ -243,10 +249,33 @@ static void button_task(void *pvParameter)
 }
 
 /********************* Zigbee Functions **************************/
-static esp_err_t deferred_driver_init(void)
+static void deferred_driver_init(void)
 {
     light_driver_init(LIGHT_DEFAULT_OFF);
-    return ESP_OK;
+}
+
+/* Auto-rejoin watchdog: triggered when consecutive Zigbee report failures exceed threshold.
+ * Mirrors the medium-press rejoin logic in button_task, but is rate-limited by REJOIN_COOLDOWN_MS
+ * to avoid thrashing if the parent is unreachable. */
+static void try_auto_rejoin(const char *reason)
+{
+    TickType_t now = xTaskGetTickCount();
+    if ((now - s_last_auto_rejoin_time) < pdMS_TO_TICKS(REJOIN_COOLDOWN_MS)) {
+        return;
+    }
+    s_last_auto_rejoin_time = now;
+    ESP_LOGE(TAG, "Auto-rejoin triggered: %s", reason);
+
+    esp_zb_lock_acquire(portMAX_DELAY);
+    esp_err_t err = esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
+    esp_zb_lock_release();
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Auto-rejoin failed to start: %s", esp_err_to_name(err));
+    } else {
+        /* Visual feedback like button rejoin */
+        blink_led(2, 100, 100);
+    }
 }
 
 /********************* CO2 Sensor Functions **************************/
@@ -271,8 +300,15 @@ static void co2_send_report(void)
 
     esp_err_t err = esp_zb_zcl_report_attr_cmd_req(&cmd);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to send CO2 report: %s", esp_err_to_name(err));
+        s_co2_report_failures++;
+        ESP_LOGW(TAG, "Failed to send CO2 report (%u/%d): %s",
+                 s_co2_report_failures, REJOIN_AFTER_FAILURES, esp_err_to_name(err));
+        if (s_co2_report_failures >= REJOIN_AFTER_FAILURES) {
+            s_co2_report_failures = 0;  /* one-shot: re-arm after triggering */
+            try_auto_rejoin("co2 report failures");
+        }
     } else {
+        s_co2_report_failures = 0;
         ESP_LOGD(TAG, "CO2 report sent successfully");
     }
 }
@@ -389,8 +425,15 @@ static void pm25_send_report(float raw_value_ug_m3)
     
     esp_err_t err = esp_zb_zcl_report_attr_cmd_req(&cmd);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to send PM2.5 report: %s", esp_err_to_name(err));
+        s_pm25_report_failures++;
+        ESP_LOGW(TAG, "Failed to send PM2.5 report (%u/%d): %s",
+                 s_pm25_report_failures, REJOIN_AFTER_FAILURES, esp_err_to_name(err));
+        if (s_pm25_report_failures >= REJOIN_AFTER_FAILURES) {
+            s_pm25_report_failures = 0;  /* one-shot: re-arm after triggering */
+            try_auto_rejoin("pm2.5 report failures");
+        }
     } else {
+        s_pm25_report_failures = 0;
         ESP_LOGI(TAG, "PM2.5 report sent successfully");
     }
 }
@@ -562,7 +605,8 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
     case ESP_ZB_BDB_SIGNAL_DEVICE_FIRST_START:
     case ESP_ZB_BDB_SIGNAL_DEVICE_REBOOT:
         if (err_status == ESP_OK) {
-            ESP_LOGI(TAG, "Deferred driver initialization %s", deferred_driver_init() ? "failed" : "successful");
+            deferred_driver_init();
+            ESP_LOGI(TAG, "Deferred driver initialization done");
             ESP_LOGI(TAG, "Device started up in %s factory-reset mode", esp_zb_bdb_is_factory_new() ? "" : "non");
             if (esp_zb_bdb_is_factory_new()) {
                 ESP_LOGI(TAG, "Start network steering");
@@ -586,6 +630,9 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                      esp_zb_get_pan_id(), esp_zb_get_current_channel(), esp_zb_get_short_address());
             /* Signal that Zigbee is ready for attribute updates */
             s_zigbee_ready = true;
+            /* Reset report failure counters on a healthy join/rejoin */
+            s_co2_report_failures = 0;
+            s_pm25_report_failures = 0;
         } else {
             ESP_LOGI(TAG, "Network steering was not successful (status: %s)", esp_err_to_name(err_status));
             esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb, ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
