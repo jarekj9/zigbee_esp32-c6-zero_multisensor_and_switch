@@ -3,7 +3,7 @@
  *
  * SPDX-License-Identifier:  LicenseRef-Included
  *
- * Zigbee HA_on_off_light Example
+ * Zigbee HA_on_off Example
  *
  * This example code is in the Public Domain (or CC0 licensed, at your option.)
  *

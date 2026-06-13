@@ -70,13 +70,8 @@ Cluster attributes use standard ZCL: CO2 normalized to 0.0-1.0 (ppm/1000000), PM
 - `s_sensor_data_mutex` - Protects latest sensor values for display
 - `esp_zb_lock_acquire/release` - Zigbee stack thread safety
 
-## Build
-```bash
-idf.py set-target esp32c6
-idf.py menuconfig  # Ensure ZB_ED_ROLE is defined
-idf.py build
-idf.py flash
-```
+## Build and Flash
+Do it via vs code extensions (ESP-IDF) - Build/Flash button
 
 ## Main Entry Point
 `esp_zb_light.c` - Initializes all peripherals (GPIO, UART, I2C, LEDC), Zigbee stack, endpoints, and starts FreeRTOS tasks.
