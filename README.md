@@ -70,6 +70,9 @@ Cluster attributes use standard ZCL: CO2 normalized to 0.0-1.0 (ppm/1000000), PM
 - `s_sensor_data_mutex` - Protects latest sensor values for display
 - `esp_zb_lock_acquire/release` - Zigbee stack thread safety
 
+## Auto-Rejoin Watchdog
+If 3 consecutive Zigbee reports fail, the device automatically triggers a network rejoin (same primitive as the medium button press). Counter resets on successful join/report. Logs `Auto-rejoin triggered: co2/pm2.5 report failures` and double-blinks the LED. Tunable via `REJOIN_AFTER_FAILURES` in `esp_zb_light.c`.
+
 ## Build and Flash
 Do it via vs code extensions (ESP-IDF) - Build/Flash button
 

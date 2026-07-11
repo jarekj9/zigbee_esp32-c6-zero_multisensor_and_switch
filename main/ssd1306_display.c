@@ -52,6 +52,7 @@ static bool s_display_available = false;
 static TaskHandle_t s_display_task_handle = NULL;
 static SemaphoreHandle_t s_i2c_mutex = NULL;
 static uint8_t s_display_addr = SSD1306_I2C_ADDR;
+static TimerHandle_t s_off_timer = NULL;
 
 /* Display framebuffer */
 static uint8_t s_framebuffer[SSD1306_PAGES][SSD1306_WIDTH];
@@ -65,6 +66,7 @@ static SemaphoreHandle_t s_data_mutex = NULL;
 static void ssd1306_display_task(void *pvParameter);
 static void update_display_content(void);
 static void ssd1306_refresh_display(void);
+static void display_off_timer_cb(TimerHandle_t xTimer);
 static bool ssd1306_write_command_addr(uint8_t addr, uint8_t cmd);
 static bool ssd1306_write_data_addr(uint8_t addr, const uint8_t *data, size_t len);
 static void draw_char(int x, int y, char c);
@@ -629,22 +631,25 @@ void ssd1306_display_update(uint16_t co2_ppm, float pm2_5)
     else
         ESP_LOGI(TAG, "Display updated - CO2:%u ppm, PM2.5:%.1f ug/m3", co2_ppm, pm2_5);
 
-    static TimerHandle_t s_off_timer = NULL;
-
     if (!s_always_on) {
         if (s_off_timer == NULL) {
             s_off_timer = xTimerCreate("disp_off", pdMS_TO_TICKS(SSD1306_DISPLAY_TIME_MS),
-                                       pdFALSE, NULL,
-                                       (TimerCallbackFunction_t)ssd1306_display_off);
+                                       pdFALSE, (void *)0,
+                                       display_off_timer_cb);
         }
         if (s_off_timer != NULL) {
-            xTimerStop(s_off_timer, 0);
-            xTimerStart(s_off_timer, 0);
+            BaseType_t result = xTimerReset(s_off_timer, pdMS_TO_TICKS(100));
+            if (result != pdPASS) {
+                ESP_LOGW(TAG, "Failed to reset display off timer (queue full?)");
+            }
         }
     } else {
         // Cancel pending off timer if always-on was just enabled mid-countdown
         if (s_off_timer != NULL) {
-            xTimerStop(s_off_timer, 0);
+            BaseType_t result = xTimerStop(s_off_timer, pdMS_TO_TICKS(100));
+            if (result != pdPASS) {
+                ESP_LOGW(TAG, "Failed to stop display off timer (queue full?)");
+            }
         }
     }
 }
@@ -672,6 +677,13 @@ void ssd1306_display_off(void)
     }
 
     ESP_LOGD(TAG, "Display turned off");
+}
+
+/* FreeRTOS timer callback wrapper with correct signature */
+static void display_off_timer_cb(TimerHandle_t xTimer)
+{
+    (void)xTimer;
+    ssd1306_display_off();
 }
 
 void ssd1306_display_on(void)
