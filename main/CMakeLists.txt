@@ -1,7 +1,7 @@
 string(REPLACE "\\" "/" IDF_PATH $ENV{IDF_PATH})
 
 idf_component_register(
-    SRC_DIRS "." "${IDF_PATH}/examples/zigbee/common/zcl_utility/src"
-    INCLUDE_DIRS "." "${IDF_PATH}/examples/zigbee/common/zcl_utility/include"
+    SRC_DIRS "." "${IDF_PATH}/examples/zigbee/zb_common_components/examples_utils"
+    INCLUDE_DIRS "." "${IDF_PATH}/examples/zigbee/zb_common_components/examples_utils/include"
     PRIV_REQUIRES nvs_flash esp_driver_uart esp_driver_gpio esp_driver_ledc esp_driver_i2c ieee802154
 )

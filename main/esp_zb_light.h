@@ -23,6 +23,8 @@
 #define HA_ESP_LIGHT_ENDPOINT           10                                   /* esp light bulb device endpoint, used to process light controlling commands */
 #define HA_ESP_CO2_SENSOR_ENDPOINT      11                                   /* CO2 sensor endpoint */
 #define HA_ESP_PM25_SENSOR_ENDPOINT     12                                   /* PM2.5 sensor endpoint */
+#define MELODY_CLUSTER_ID               0xFC00                               /* Custom buzzer melody cluster */
+/* Melody input limits (text/steps/durations) are defined in melody_parser.h. */
 #define ESP_ZB_PRIMARY_CHANNEL_MASK     ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK /* Zigbee primary channel mask use in the example */
 
 /* CO2 Sensor Configuration */

@@ -16,6 +16,7 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include <string.h>
 #include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "ha/esp_zigbee_ha_standard.h"
@@ -23,6 +24,7 @@
 #include "mhz19b_driver.h"
 #include "sps30_driver.h"
 #include "ssd1306_display.h"
+#include "melody_parser.h"
 #include "zcl/esp_zigbee_zcl_pm2_5_measurement.h"
 
 #if !defined ZB_ED_ROLE
@@ -37,21 +39,20 @@
 #define REJOIN_COOLDOWN_MS 5000
 #define REJOIN_AFTER_FAILURES 5   /* Auto-rejoin after N consecutive report failures */
 
-// Note frequencies in Hz
-#define NOTE_E5  659
-#define NOTE_C5  523
-#define NOTE_G5  784
-#define NOTE_G4  392
-#define NOTE_E4  330
-#define NOTE_A4  440
-#define NOTE_B4  494
-#define NOTE_A4S 466
-#define NOTE_D5  587
-#define NOTE_F5  698
+#define DEFAULT_MELODY "E5:120 R:30 E5:120 R:150 E5:120 R:150 C5:120 R:30 E5:120 R:150 G5:120 R:350 G4:120 R:350"
+#define MELODY_ATTR_ID 0x0000
+#define MELODY_ERROR_ATTR_ID 0x0001
+#define MELODY_PLAY_COMMAND_ID 0x00
 
 static const char *TAG = "ESP_ZB_ON_OFF_LIGHT";
 static volatile uint32_t last_interrupt_time = 0;
 static TaskHandle_t buzzer_task_handle = NULL;
+static SemaphoreHandle_t s_melody_mutex = NULL;
+static melody_t s_active_melody;
+static char s_active_melody_text[MELODY_MAX_TEXT + 1] = {0};
+/* A ZCL char string can carry at most 255 bytes plus its length prefix. */
+static uint8_t s_melody_attr[256] = {0};
+static uint8_t s_melody_last_error = MELODY_ERROR_OK;
 static TaskHandle_t co2_sensor_task_handle = NULL;
 static TaskHandle_t pm25_sensor_task_handle = NULL;
 static esp_zb_zcl_reporting_info_t co2_reporting_info;
@@ -121,28 +122,35 @@ static void buzzer_tone(uint32_t frequency, uint32_t duration_ms)
     ledc_update_duty(LEDC_LOW_SPEED_MODE, BUZZER_CHANNEL);
 }
 
+static void buzzer_silence(uint32_t duration_ms)
+{
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, BUZZER_CHANNEL, 0);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, BUZZER_CHANNEL);
+    vTaskDelay(pdMS_TO_TICKS(duration_ms));
+}
+
+static void buzzer_play_snapshot(const melody_t *melody)
+{
+    for (uint8_t i = 0; i < melody->count; ++i) {
+        if (melody->steps[i].freq_hz == 0) {
+            buzzer_silence(melody->steps[i].duration_ms);
+        } else {
+            buzzer_tone(melody->steps[i].freq_hz, melody->steps[i].duration_ms);
+        }
+    }
+}
+
 static void buzzer_task(void *pvParameter)
 {
     while(1) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        
-        // Playful video game style melody
-        buzzer_tone(NOTE_E5, 120);
-        vTaskDelay(pdMS_TO_TICKS(30));
-        buzzer_tone(NOTE_E5, 120);
-        vTaskDelay(pdMS_TO_TICKS(150));
-        buzzer_tone(NOTE_E5, 120);
-        vTaskDelay(pdMS_TO_TICKS(150));
-        
-        buzzer_tone(NOTE_C5, 120);
-        vTaskDelay(pdMS_TO_TICKS(30));
-        buzzer_tone(NOTE_E5, 120);
-        vTaskDelay(pdMS_TO_TICKS(150));
-        buzzer_tone(NOTE_G5, 120);
-        vTaskDelay(pdMS_TO_TICKS(350));
-        
-        buzzer_tone(NOTE_G4, 120);
-        vTaskDelay(pdMS_TO_TICKS(350));
+
+        melody_t snapshot;
+        if (xSemaphoreTake(s_melody_mutex, portMAX_DELAY) == pdTRUE) {
+            memcpy(&snapshot, &s_active_melody, sizeof(snapshot));
+            xSemaphoreGive(s_melody_mutex);
+            buzzer_play_snapshot(&snapshot);
+        }
     }
 }
 
@@ -159,7 +167,7 @@ static void buzzer_init(void)
         .speed_mode = LEDC_LOW_SPEED_MODE,
         .duty_resolution = LEDC_TIMER_10_BIT,
         .timer_num = BUZZER_TIMER,
-        .freq_hz = NOTE_C5,
+        .freq_hz = 523,
         .clk_cfg = LEDC_AUTO_CLK
     };
     ledc_timer_config(&timer_conf);
@@ -173,6 +181,18 @@ static void buzzer_init(void)
         .hpoint = 0
     };
     ledc_channel_config(&channel_conf);
+}
+
+static void melody_set_error(melody_error_t error)
+{
+    if (xSemaphoreTake(s_melody_mutex, portMAX_DELAY) != pdTRUE) {
+        return;
+    }
+    s_melody_last_error = (uint8_t)error;
+    size_t valid_len = strlen(s_active_melody_text);
+    s_melody_attr[0] = (uint8_t)valid_len;
+    memcpy(&s_melody_attr[1], s_active_melody_text, valid_len);
+    xSemaphoreGive(s_melody_mutex);
 }
 
 /********************* Button Functions **************************/
@@ -209,7 +229,10 @@ static void button_task(void *pvParameter)
         if(press_ms >= 5000) {
             ESP_LOGW(TAG, "Factory reset triggered");
             blink_led(5, 100, 100);
-            esp_zb_factory_reset();
+            if (esp_zb_lock_acquire(portMAX_DELAY)) {
+                esp_zb_factory_reset();
+                esp_zb_lock_release();
+            }
 
         } else if(press_ms >= 500) {
             TickType_t current_time = xTaskGetTickCount();
@@ -257,32 +280,31 @@ static void deferred_driver_init(void)
 /* Auto-rejoin watchdog: triggered when consecutive Zigbee report failures exceed threshold.
  * Mirrors the medium-press rejoin logic in button_task, but is rate-limited by REJOIN_COOLDOWN_MS
  * to avoid thrashing if the parent is unreachable. */
-static void try_auto_rejoin(const char *reason)
+/* Called by sensor report helpers while the caller already owns the Zigbee lock. */
+static bool try_auto_rejoin(const char *reason)
 {
     TickType_t now = xTaskGetTickCount();
     if ((now - s_last_auto_rejoin_time) < pdMS_TO_TICKS(REJOIN_COOLDOWN_MS)) {
-        return;
+        return false;
     }
     s_last_auto_rejoin_time = now;
     ESP_LOGE(TAG, "Auto-rejoin triggered: %s", reason);
 
-    esp_zb_lock_acquire(portMAX_DELAY);
     esp_err_t err = esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
-    esp_zb_lock_release();
 
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Auto-rejoin failed to start: %s", esp_err_to_name(err));
-    } else {
-        /* Visual feedback like button rejoin */
-        blink_led(2, 100, 100);
+        return false;
     }
+    return true;
 }
 
 /********************* CO2 Sensor Functions **************************/
 
 /* Helper function to send explicit attribute report to coordinator */
-static void co2_send_report(void)
+static bool co2_send_report(void)
 {
+    bool blink_after_unlock = false;
     esp_zb_zcl_report_attr_cmd_t cmd = {
         .zcl_basic_cmd = {
             .dst_addr_u.addr_short = 0x0000,  /* Coordinator */
@@ -305,12 +327,13 @@ static void co2_send_report(void)
                  s_co2_report_failures, REJOIN_AFTER_FAILURES, esp_err_to_name(err));
         if (s_co2_report_failures >= REJOIN_AFTER_FAILURES) {
             s_co2_report_failures = 0;  /* one-shot: re-arm after triggering */
-            try_auto_rejoin("co2 report failures");
+            blink_after_unlock = try_auto_rejoin("co2 report failures");
         }
     } else {
         s_co2_report_failures = 0;
         ESP_LOGD(TAG, "CO2 report sent successfully");
     }
+    return blink_after_unlock;
 }
 
 static void co2_sensor_task(void *pvParameter)
@@ -362,9 +385,12 @@ static void co2_sensor_task(void *pvParameter)
                                               false);
 
                 /* Send explicit report to coordinator */
-                co2_send_report();
+                bool blink_after_unlock = co2_send_report();
 
                 esp_zb_lock_release();
+                if (blink_after_unlock) {
+                    blink_led(2, 100, 100);
+                }
             } else {
                 ESP_LOGW(TAG, "Failed to acquire Zigbee lock for CO2 reporting");
             }
@@ -386,9 +412,12 @@ static void co2_sensor_task(void *pvParameter)
                                               false);
 
                 /* Send explicit report to coordinator */
-                co2_send_report();
+                bool blink_after_unlock = co2_send_report();
 
                 esp_zb_lock_release();
+                if (blink_after_unlock) {
+                    blink_led(2, 100, 100);
+                }
             }
 
             /* Still update the display with last known values so it doesn't freeze */
@@ -403,8 +432,9 @@ static void co2_sensor_task(void *pvParameter)
 /********************* PM2.5 Sensor Functions **************************/
 
 /* Helper function to send explicit attribute report for PM2.5 to coordinator */
-static void pm25_send_report(float raw_value_ug_m3)
+static bool pm25_send_report(float raw_value_ug_m3)
 {
+    bool blink_after_unlock = false;
     // Report PM2.5 Measurement cluster (raw ug/m3 value)
     esp_zb_zcl_report_attr_cmd_t cmd = {
         .zcl_basic_cmd = {
@@ -430,12 +460,13 @@ static void pm25_send_report(float raw_value_ug_m3)
                  s_pm25_report_failures, REJOIN_AFTER_FAILURES, esp_err_to_name(err));
         if (s_pm25_report_failures >= REJOIN_AFTER_FAILURES) {
             s_pm25_report_failures = 0;  /* one-shot: re-arm after triggering */
-            try_auto_rejoin("pm2.5 report failures");
+            blink_after_unlock = try_auto_rejoin("pm2.5 report failures");
         }
     } else {
         s_pm25_report_failures = 0;
         ESP_LOGI(TAG, "PM2.5 report sent successfully");
     }
+    return blink_after_unlock;
 }
 
 static void pm25_sensor_task(void *pvParameter)
@@ -547,8 +578,11 @@ static void pm25_sensor_task(void *pvParameter)
                     ESP_LOGW(TAG, "Failed to set PM2.5 attribute: %s", esp_err_to_name(set_err));
                 }
 
-                pm25_send_report(pm25_avg);
+                bool blink_after_unlock = pm25_send_report(pm25_avg);
                 esp_zb_lock_release();
+                if (blink_after_unlock) {
+                    blink_led(2, 100, 100);
+                }
             } else {
                 ESP_LOGW(TAG, "Failed to acquire Zigbee lock for PM2.5 reporting");
             }
@@ -569,8 +603,11 @@ static void pm25_sensor_task(void *pvParameter)
                                               &s_pm25_measured_value,
                                               false);
 
-                pm25_send_report(0.0f / 0.0f);
+                bool blink_after_unlock = pm25_send_report(0.0f / 0.0f);
                 esp_zb_lock_release();
+                if (blink_after_unlock) {
+                    blink_led(2, 100, 100);
+                }
             }
 
             /* Still update display with last known values */
@@ -589,6 +626,47 @@ static void pm25_sensor_task(void *pvParameter)
 static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
 {
     ESP_RETURN_ON_FALSE(esp_zb_bdb_start_top_level_commissioning(mode_mask) == ESP_OK, , TAG, "Failed to start Zigbee commissioning");
+}
+
+static esp_err_t melody_attribute_write(const esp_zb_zcl_set_attr_value_message_t *message)
+{
+    melody_t parsed;
+    melody_error_t error;
+    char text[MELODY_MAX_TEXT + 1];
+    const uint8_t *zcl_string = message->attribute.data.value;
+
+    if (message->attribute.data.type != ESP_ZB_ZCL_ATTR_TYPE_CHAR_STRING || zcl_string == NULL ||
+        message->attribute.data.size < 1) {
+        melody_set_error(MELODY_ERROR_LENGTH);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    size_t text_len = zcl_string[0];
+    if (text_len == 0 || text_len > MELODY_MAX_TEXT || text_len > message->attribute.data.size - 1) {
+        melody_set_error(MELODY_ERROR_LENGTH);
+        return ESP_ERR_INVALID_ARG;
+    }
+    memcpy(text, &zcl_string[1], text_len);
+    text[text_len] = '\0';
+
+    error = melody_parse(text, text_len, &parsed);
+    if (error != MELODY_ERROR_OK) {
+        melody_set_error(error);
+        ESP_LOGW(TAG, "Rejected melody payload (error %u)", (unsigned)error);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* Playback only holds this mutex long enough to copy its melody snapshot. */
+    if (xSemaphoreTake(s_melody_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_FAIL;
+    }
+    memcpy(&s_active_melody, &parsed, sizeof(parsed));
+    memcpy(s_active_melody_text, text, text_len + 1);
+    s_melody_attr[0] = (uint8_t)text_len;
+    memcpy(&s_melody_attr[1], text, text_len);
+    s_melody_last_error = MELODY_ERROR_OK;
+    xSemaphoreGive(s_melody_mutex);
+    return ESP_OK;
 }
 
 void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
@@ -672,6 +750,8 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
                 // Play melody when triggered
                 buzzer_play_melody_async();
             }
+        } else if (message->info.cluster == MELODY_CLUSTER_ID && message->attribute.id == MELODY_ATTR_ID) {
+            ret = melody_attribute_write(message);
         }
     }
     return ret;
@@ -684,6 +764,14 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
     case ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID:
         ret = zb_attribute_handler((esp_zb_zcl_set_attr_value_message_t *)message);
         break;
+    case ESP_ZB_CORE_CMD_CUSTOM_CLUSTER_REQ_CB_ID: {
+        const esp_zb_zcl_custom_cluster_command_message_t *command = message;
+        if (command != NULL && command->info.dst_endpoint == HA_ESP_LIGHT_ENDPOINT &&
+            command->info.cluster == MELODY_CLUSTER_ID && command->info.command.id == MELODY_PLAY_COMMAND_ID) {
+            buzzer_play_melody_async();
+        }
+        break;
+    }
     default:
         ESP_LOGW(TAG, "Receive Zigbee action(0x%x) callback", callback_id);
         break;
@@ -696,9 +784,57 @@ static void esp_zb_task(void *pvParameters)
     esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_ZED_CONFIG();
     esp_zb_init(&zb_nwk_cfg);
 
-    /* === Endpoint 10: On/Off Light (Buzzer control) - keep original === */
-    esp_zb_on_off_light_cfg_t light_cfg = ESP_ZB_DEFAULT_ON_OFF_LIGHT_CONFIG();
-    esp_zb_ep_list_t *ep_list = esp_zb_on_off_light_ep_create(HA_ESP_LIGHT_ENDPOINT, &light_cfg);
+    /* === Endpoint 10: existing On/Off light plus configurable melody cluster === */
+    esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();
+    esp_zb_cluster_list_t *light_cluster_list = esp_zb_zcl_cluster_list_create();
+    ESP_ERROR_CHECK(ep_list != NULL && light_cluster_list != NULL ? ESP_OK : ESP_ERR_NO_MEM);
+    esp_zb_basic_cluster_cfg_t light_basic_cfg = {
+        .zcl_version = ESP_ZB_ZCL_BASIC_ZCL_VERSION_DEFAULT_VALUE,
+        .power_source = ESP_ZB_ZCL_BASIC_POWER_SOURCE_DEFAULT_VALUE,
+    };
+    esp_zb_identify_cluster_cfg_t light_identify_cfg = {
+        .identify_time = ESP_ZB_ZCL_IDENTIFY_IDENTIFY_TIME_DEFAULT_VALUE,
+    };
+    esp_zb_groups_cluster_cfg_t light_groups_cfg = {
+        .groups_name_support_id = ESP_ZB_ZCL_GROUPS_NAME_SUPPORT_DEFAULT_VALUE,
+    };
+    esp_zb_scenes_cluster_cfg_t light_scenes_cfg = {
+        .scenes_count = ESP_ZB_ZCL_SCENES_SCENE_COUNT_DEFAULT_VALUE,
+        .current_scene = ESP_ZB_ZCL_SCENES_CURRENT_SCENE_DEFAULT_VALUE,
+        .current_group = ESP_ZB_ZCL_SCENES_CURRENT_GROUP_DEFAULT_VALUE,
+        .scene_valid = ESP_ZB_ZCL_SCENES_SCENE_VALID_DEFAULT_VALUE,
+        .name_support = ESP_ZB_ZCL_SCENES_NAME_SUPPORT_DEFAULT_VALUE,
+    };
+    esp_zb_on_off_cluster_cfg_t light_on_off_cfg = {
+        .on_off = ESP_ZB_ZCL_ON_OFF_ON_OFF_DEFAULT_VALUE,
+    };
+    ESP_ERROR_CHECK(esp_zb_cluster_list_add_basic_cluster(light_cluster_list,
+        esp_zb_basic_cluster_create(&light_basic_cfg), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+    ESP_ERROR_CHECK(esp_zb_cluster_list_add_identify_cluster(light_cluster_list,
+        esp_zb_identify_cluster_create(&light_identify_cfg), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+    ESP_ERROR_CHECK(esp_zb_cluster_list_add_groups_cluster(light_cluster_list,
+        esp_zb_groups_cluster_create(&light_groups_cfg), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+    ESP_ERROR_CHECK(esp_zb_cluster_list_add_scenes_cluster(light_cluster_list,
+        esp_zb_scenes_cluster_create(&light_scenes_cfg), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+    ESP_ERROR_CHECK(esp_zb_cluster_list_add_on_off_cluster(light_cluster_list,
+        esp_zb_on_off_cluster_create(&light_on_off_cfg), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+
+    esp_zb_attribute_list_t *melody_cluster = esp_zb_zcl_attr_list_create(MELODY_CLUSTER_ID);
+    ESP_ERROR_CHECK(melody_cluster != NULL ? ESP_OK : ESP_ERR_NO_MEM);
+    ESP_ERROR_CHECK(esp_zb_cluster_add_attr(melody_cluster, MELODY_CLUSTER_ID, MELODY_ATTR_ID,
+        ESP_ZB_ZCL_ATTR_TYPE_CHAR_STRING, ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE, s_melody_attr));
+    ESP_ERROR_CHECK(esp_zb_cluster_add_attr(melody_cluster, MELODY_CLUSTER_ID, MELODY_ERROR_ATTR_ID,
+        ESP_ZB_ZCL_ATTR_TYPE_U8, ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_melody_last_error));
+    ESP_ERROR_CHECK(esp_zb_cluster_list_add_custom_cluster(light_cluster_list, melody_cluster,
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+
+    esp_zb_endpoint_config_t light_ep_config = {
+        .endpoint = HA_ESP_LIGHT_ENDPOINT,
+        .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .app_device_id = ESP_ZB_HA_ON_OFF_LIGHT_DEVICE_ID,
+        .app_device_version = 0,
+    };
+    ESP_ERROR_CHECK(esp_zb_ep_list_add_ep(ep_list, light_cluster_list, light_ep_config));
 
     /* === Endpoint 11: Carbon Dioxide Sensor === */
     /* Create cluster list for CO2 sensor */
@@ -881,6 +1017,15 @@ void app_main(void)
 
     // Create mutex for sensor data sharing
     s_sensor_data_mutex = xSemaphoreCreateMutex();
+    s_melody_mutex = xSemaphoreCreateMutex();
+    configASSERT(s_melody_mutex != NULL);
+
+    ESP_ERROR_CHECK(melody_parse(DEFAULT_MELODY, strlen(DEFAULT_MELODY), &s_active_melody) == MELODY_ERROR_OK
+                    ? ESP_OK : ESP_FAIL);
+    size_t default_melody_len = strlen(DEFAULT_MELODY);
+    memcpy(s_active_melody_text, DEFAULT_MELODY, default_melody_len + 1);
+    s_melody_attr[0] = (uint8_t)default_melody_len;
+    memcpy(&s_melody_attr[1], DEFAULT_MELODY, default_melody_len);
 
     // Display setup (non-critical - continues if display not connected)
     esp_err_t display_err = ssd1306_display_init();
