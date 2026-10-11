@@ -13,17 +13,19 @@ Expert guidance for coding the ESP32-C6-Zero Zigbee multi-sensor (ESP-IDF). Hard
   ```sh
   gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -I main main/melody_parser.c test/host/test_melody_parser.c -o melody_parser_test
   ./melody_parser_test
+  gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -I main main/melody_parser.c main/melody_upload.c test/host/test_melody_upload.c -o melody_upload_test
+  ./melody_upload_test
   ```
 - Do not claim a firmware change works without a successful build; say clearly when you could not test on hardware.
 
 ## Code map
 - `main/esp_zb_light.c`: entry point, peripheral init, Zigbee stack, endpoints, task creation.
-- `main/melody_parser.c`: melody text parsing and validation (limits: 24 tokens, 120 chars, 15 s total, notes 10-2000 ms).
+- `main/melody_parser.c`: melody text parsing and validation (limits: 24 tokens, 300 chars, 15 s total, notes 10-2000 ms).
 - Buzzer, sensor, display, button, and LED logic live alongside these files in `main/`.
 
 ## Rules
 - Keep `README.md` in sync with any protocol, endpoint, pin, or behaviour change.
-- Melody rules must match the README exactly: A-G with optional `#`, octave 3-6, `R` for rest, no flats, no E#/B#. Error codes 0-6 must stay in sync with the Z2M converter.
+- Melody rules must match the README exactly: A-G with optional `#`, octave 3-6, `R` for rest, no flats, no E#/B#. Parser error codes 0-6 and upload error codes 7-8 must stay in sync with the Z2M converter.
 - Melodies are RAM-only and reset on reboot. Do not add flash storage without asking.
 - Keep Zigbee stack calls inside `esp_zb_lock_acquire/release`. Protect shared sensor data with `s_sensor_data_mutex`.
 - Do not read unrelated files or commit secrets.

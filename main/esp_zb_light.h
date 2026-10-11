@@ -24,6 +24,11 @@
 #define HA_ESP_CO2_SENSOR_ENDPOINT      11                                   /* CO2 sensor endpoint */
 #define HA_ESP_PM25_SENSOR_ENDPOINT     12                                   /* PM2.5 sensor endpoint */
 #define MELODY_CLUSTER_ID               0xFC00                               /* Custom buzzer melody cluster */
+#define MELODY_ATTR_ID                  0x0000                               /* Effective melody text (read/write) */
+#define MELODY_ERROR_ATTR_ID            0x0001                               /* Last melody operation error (read-only) */
+#define MELODY_CTRL_ATTR_ID             0x0002                               /* START/COMMIT/ABORT upload control (write-only) */
+#define MELODY_CHUNK_ATTR_ID            0x0003                               /* One <80-character staging chunk (write-only) */
+#define MELODY_PLAY_COMMAND_ID          0x00                                 /* Play custom melody, or default if unset */
 /* Melody input limits (text/steps/durations) are defined in melody_parser.h. */
 #define ESP_ZB_PRIMARY_CHANNEL_MASK     ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK /* Zigbee primary channel mask use in the example */
 

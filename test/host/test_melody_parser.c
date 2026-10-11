@@ -9,7 +9,10 @@
 static void expect_error(const char *text, melody_error_t expected)
 {
     melody_t melody = {0};
-    assert(melody_parse(text, strlen(text), &melody) == expected);
+    melody_error_t error = melody_parse(text, strlen(text), &melody);
+    assert(error != MELODY_ERROR_SEQUENCE);
+    assert(error != MELODY_ERROR_UNKNOWN_OP);
+    assert(error == expected);
 }
 
 int main(void)
@@ -29,7 +32,7 @@ int main(void)
     const char *octave_bounds = "C3:100 C6:100";
     assert(melody_parse(octave_bounds, strlen(octave_bounds), &melody) == MELODY_ERROR_OK);
     assert(melody.steps[0].freq_hz == 131 && melody.steps[1].freq_hz == 1047);
-    char max_tokens[120];
+    char max_tokens[MELODY_MAX_TEXT + 1];
     size_t offset = 0;
     for (unsigned i = 0; i < MELODY_MAX_STEPS; ++i) {
         if (i != 0) max_tokens[offset++] = ' ';
@@ -39,17 +42,20 @@ int main(void)
     assert(offset == 119);
     assert(melody_parse(max_tokens, offset, &melody) == MELODY_ERROR_OK);
     assert(melody.count == MELODY_MAX_STEPS && melody.total_ms == 240);
-    max_tokens[offset++] = ' ';
+    /* Trailing whitespace pads the text up to the 300-character limit. */
+    while (offset < MELODY_MAX_TEXT) {
+        max_tokens[offset++] = ' ';
+    }
     assert(offset == MELODY_MAX_TEXT);
     assert(melody_parse(max_tokens, offset, &melody) == MELODY_ERROR_OK);
-    char too_many_tokens[125];
+    char too_many_tokens[130];
     offset = 0;
     for (unsigned i = 0; i < MELODY_MAX_STEPS + 1; ++i) {
         if (i != 0) too_many_tokens[offset++] = ' ';
         memcpy(&too_many_tokens[offset], "R:10", 4);
         offset += 4;
     }
-    assert(melody_parse(too_many_tokens, offset, &melody) == MELODY_ERROR_LENGTH);
+    assert(melody_parse(too_many_tokens, offset, &melody) == MELODY_ERROR_STEP_COUNT);
     expect_error("", MELODY_ERROR_LENGTH);
     expect_error("   ", MELODY_ERROR_STEP_COUNT);
     expect_error("C5:10\tD5:10", MELODY_ERROR_SYNTAX);
@@ -85,6 +91,7 @@ int main(void)
     memset(too_long, ' ', sizeof(too_long));
     too_long[sizeof(too_long) - 1] = '\0';
     assert(melody_parse(too_long, MELODY_MAX_TEXT + 1, &melody) == MELODY_ERROR_LENGTH);
+    assert(melody_parse(too_long, MELODY_MAX_TEXT, &melody) == MELODY_ERROR_STEP_COUNT);
 
     /* The parser honors len and does not require a terminating NUL byte. */
     const char truncated[] = {'C', '5', ':'};

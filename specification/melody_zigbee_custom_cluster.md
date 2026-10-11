@@ -1,205 +1,335 @@
-# Specification: Z2M-configurable buzzer melody
+# Specification: Z2M-configurable buzzer melody (chunked upload, active/default state)
+
+Status: implemented specification (v2). Supersedes the v1 text that said On/Off plays the active melody.
+Scope: defines the implementation and its verification expectations. Remaining hardware/Z2M checks are called out in section 17.
 
 ## 1. Objective
-Allow Home Assistant / Zigbee2MQTT (Z2M) to set a buzzer melody as text (notes, durations, rests) and trigger playback, while keeping all existing behavior:
-- Endpoint 10 stays a standard HA On/Off Light (`ESP_ZB_HA_ON_OFF_LIGHT_DEVICE_ID` 0x0100). Any On/Off attribute write still plays the melody.
-- Endpoints 11 (CO2) and 12 (PM2.5) unchanged.
-- Buzzer GPIO20 / LEDC unchanged (`BUZZER_GPIO`, `BUZZER_CHANNEL`, `BUZZER_TIMER`, duty 512 on 10-bit).
-- Default melody (no custom set since boot) must be audibly identical to the current fixed tune.
+Let Zigbee2MQTT (Z2M) / Home Assistant:
+1. Upload a melody text of up to 300 chars using several short writes (each chunk **at most 79 chars**, i.e. `<80`), because single long ZCL writes are unreliable in practice.
+2. Commit the upload atomically (valid melody replaces the active one; invalid one is rejected and nothing changes).
+3. Clear the custom melody back to the default without reboot (empty commit).
+4. Trigger playback with `play`.
 
-## 2. Relevant existing architecture
+Playback rules (fixed):
+- **On/Off** (endpoint 10 `ON_OFF` attribute write) **always plays the hardcoded DEFAULT melody**, regardless of any custom melody.
+- **`play` command** (cluster `0xFC00`, cmd `0x00`) plays the **ACTIVE** melody if a custom one is committed, otherwise the DEFAULT melody.
+
+Unchanged: endpoints 11 (CO2) and 12 (PM2.5), sensors, display, button, auto-rejoin, GPIO20 / LEDC config, `buzzer_tone()` (duty 512, 10-bit).
+
+## 2. Pre-change architecture (migration context)
 - `main/esp_zb_light.c`
-  - `buzzer_task()`: `ulTaskNotifyTake`; plays hard-coded sequence via `buzzer_tone(freq, ms)` + `vTaskDelay`.
-  - `buzzer_play_melody_async()`: `xTaskNotify(buzzer_task_handle, 0, eNoAction)`. Notifications coalesce (one replay pending max).
-  - `zb_attribute_handler()`: on `ESP_ZB_ZCL_CLUSTER_ID_ON_OFF` / `ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID` at `HA_ESP_LIGHT_ENDPOINT` calls `buzzer_play_melody_async()`. Registered via `zb_action_handler()` for `ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID`.
-  - `esp_zb_task()`: endpoint 10 created by `esp_zb_on_off_light_ep_create(HA_ESP_LIGHT_ENDPOINT, &light_cfg)` (cfg from `ESP_ZB_DEFAULT_ON_OFF_LIGHT_CONFIG()`). Endpoints 11/12 built manually with `esp_zb_zcl_attr_list_create` + `esp_zb_cluster_list_add_*`. Manufacturer info added via `esp_zcl_utility_add_ep_basic_manufacturer_info` for eps 10/11/12.
-  - Note frequencies `NOTE_*` macros at top of file (E5 659, C5 523, G5 784, G4 392 are required to match).
-- `main/esp_zb_light.h`: `HA_ESP_LIGHT_ENDPOINT 10`, `ESP_MANUFACTURER_NAME "ESPRESSIF"`, `ESP_MODEL_IDENTIFIER "esp32c6"` (from `CONFIG_IDF_TARGET`).
-- `main/CMakeLists.txt`: `SRC_DIRS "."`, so new `.c` files in `main/` build automatically.
-- `main/idf_component.yml`: esp-zigbee-lib `~1.6.0`, esp-zboss-lib `~1.6.0`.
-- Verified API (managed_components/espressif__esp-zigbee-lib/include):
-  - `esp_zb_cluster_list_add_custom_cluster(cluster_list, attr_list, role_mask)` (esp_zigbee_cluster.h:1294)
-  - `esp_zb_zcl_attr_list_create(cluster_id)` (esp_zigbee_attribute.h:27)
-  - `esp_zb_on_off_cluster_create(esp_zb_on_off_cluster_cfg_t*)` and `esp_zb_cluster_list_add_on_off_cluster(...)` (esp_zigbee_cluster.h:103, 673)
-  - `ESP_ZB_CORE_CMD_CUSTOM_CLUSTER_REQ_CB_ID` = 0x1040 (zcl/esp_zigbee_zcl_core.h:170)
-  - `esp_zb_zcl_custom_cluster_cmd_req()` exists (esp_zigbee_zcl_command.h:3630) - for sending only, not needed here.
-  - Types: `ESP_ZB_ZCL_ATTR_TYPE_CHAR_STRING` (0x42), `ESP_ZB_ZCL_ATTR_TYPE_U8` (0x20), `ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY/WRITE_ONLY`.
+  - Constants: `DEFAULT_MELODY` (line 42), `MELODY_ATTR_ID 0x0000`, `MELODY_ERROR_ATTR_ID 0x0001`, `MELODY_PLAY_COMMAND_ID 0x00`.
+  - State: `s_melody_mutex`, `s_active_melody` (`melody_t`), `s_active_melody_text[301]`, `s_melody_attr[256]` (ZCL char-string backing buffer, `[0]` = length), `s_melody_last_error`.
+  - `buzzer_task()`: `ulTaskNotifyTake`, then copies `s_active_melody` under mutex and plays snapshot. Always plays ACTIVE today (**must change**: On/Off must play DEFAULT).
+  - `buzzer_play_melody_async()`: `xTaskNotify(handle, 0, eNoAction)` (coalesces to one pending replay).
+  - `buzzer_play_snapshot()`, `buzzer_tone()`, `buzzer_silence()`, `buzzer_init()` (keep as is).
+  - `melody_set_error()`: rewrites `s_melody_attr` from `s_active_melody_text`, sets `s_melody_last_error`.
+  - `melody_attribute_write()`: handles only attr `0x0000`; parses single write up to 300 chars; on success replaces active; on failure keeps old active.
+  - `zb_attribute_handler()`: On/Off branch at `HA_ESP_LIGHT_ENDPOINT` calls `buzzer_play_melody_async()`; melody branch calls `melody_attribute_write()`. Both run in the Zigbee task.
+  - `zb_action_handler()`: `ESP_ZB_CORE_CMD_CUSTOM_CLUSTER_REQ_CB_ID` branch: cluster `MELODY_CLUSTER_ID`, cmd `0x00` -> `buzzer_play_melody_async()`.
+  - `esp_zb_task()`: endpoint 10 built manually (basic, identify, groups, scenes, on_off, custom cluster `melody_cluster` with attrs `0x0000` CHAR_STRING RW and `0x0001` U8 RO via `esp_zb_cluster_list_add_custom_cluster`). Endpoints 11/12 unchanged.
+  - `app_main()`: creates `s_melody_mutex`, parses `DEFAULT_MELODY` into `s_active_melody` and writes `s_melody_attr`; creates `buzzer_task` (stack 2048, prio 5).
+- `main/esp_zb_light.h`: `MELODY_CLUSTER_ID 0xFC00`, `HA_ESP_LIGHT_ENDPOINT 10`.
+- `main/melody_parser.{h,c}`: pure C, no ESP includes. `MELODY_MAX_TEXT 300`, `MELODY_MAX_STEPS 24`, `MELODY_MIN_MS 10`, `MELODY_MAX_MS 2000`, `MELODY_MAX_TOTAL_MS 15000`. `melody_parse(text, len, out)` writes `out` only on success. Parser errors `MELODY_ERROR_OK..MELODY_ERROR_TOTAL_DURATION` are 0..6; upload protocol adds `MELODY_ERROR_SEQUENCE=7` and `MELODY_ERROR_UNKNOWN_OP=8`.
+- `main/CMakeLists.txt`: `SRC_DIRS "." ...`, `INCLUDE_DIRS "."` -> any new `main/*.c` / `.h` builds automatically.
+- `test/host/test_melody_parser.c`: plain `assert` tests, built with gcc (command in README/AGENTS).
+- `z2m/esp32c6_melody.mjs` (source copy; AGENTS says keep in sync with `data/external_converters/esp32c6_melody.mjs` on the server). Current converter: attr `melody` (0x42, write), `last_error` (0x20), cmd `play`; `melody` write = single write of up to 300 chars.
+- `README.md` (Zigbee table, Buzzer section, Z2M section) and `MELODY_HELP.md` describe the **old** behaviour (On/Off plays custom tune; 80-char practical limit) and must be updated.
+- `progress.md` tracks implementation and verification progress; it is not part of firmware behavior.
 
-## 3. Chosen Zigbee interface (decision)
-Add a **manufacturer-range custom cluster on endpoint 10**, no manufacturer code in ZCL frames.
+Verified SDK facts (`managed_components/espressif__esp-zigbee-lib/include/zcl/esp_zigbee_zcl_command.h:2408`): `esp_zb_zcl_custom_cluster_command_message_t` = `{ info; struct { uint16_t size; void *value; } data; }`. Attribute writes arrive as `esp_zb_zcl_set_attr_value_message_t` with `attribute.data.{type,size,value}`; for CHAR_STRING, `value[0]` is the length prefix.
 
-| Item | Value |
-|---|---|
-| Cluster ID | `0xFC00` (name `MELODY_CLUSTER_ID`, define in `esp_zb_light.h`) |
-| Role | Server (`ESP_ZB_ZCL_CLUSTER_SERVER_ROLE`) |
-| Endpoint | 10 (same as On/Off) |
-| Manufacturer code | none (`ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC`) |
-| Attr 0x0000 `melody` | CHAR_STRING (0x42), READ+WRITE, max 120 chars. Stores the ACTIVE melody text. |
-| Attr 0x0001 `last_error` | U8, READ_ONLY. 0 = OK, else error code (section 6). |
-| Cmd 0x00 `play` | Received (client->server), no payload. Triggers playback. |
+**Confirmed:** `ESP_ZB_ZCL_ATTR_ACCESS_WRITE_ONLY` exists in the project's esp-zigbee-lib headers (`esp_zigbee_zcl_common.h`).
 
-Rationale: standard HA cluster cannot carry text; attribute write + command give atomic-enough set/trigger; the On/Off path keeps working unchanged.
+## 3. Zigbee interface (decision)
 
-ESP-Zigbee headers confirm `attribute.data.value` contains the char-string length prefix and `attribute.data.size` is the value size. Firmware uses a 256-byte backing buffer (max one-byte length plus 255 bytes) and separately enforces the 120-character melody limit.
+Cluster `0xFC00` (`MELODY_CLUSTER_ID`), server role, endpoint 10, no manufacturer code. Same cluster as v1; **new attributes added**, existing IDs kept for migration.
 
-## 4. Melody text grammar (exact)
-Input is ASCII. Tokens separated by one or more spaces (0x20). Leading/trailing spaces allowed. Tabs, commas, other chars = syntax error.
+| ID | Name | Type | Access | Semantics |
+|---|---|---|---|---|
+| `0x0000` | `melody` | CHAR_STRING (0x42) | READ + WRITE | **Read:** effective text = custom ACTIVE text if committed, else DEFAULT text. **Write:** single-shot atomic set up to 300 chars (see 3.1). Backing buffer `s_melody_attr[256]`. |
+| `0x0001` | `last_error` | U8 (0x20) | READ_ONLY | Result of the last melody write/ctrl/commit. 0 = OK, else code from section 6. |
+| `0x0002` | `melody_ctrl` | U8 (0x20) | WRITE_ONLY | Session control: `1` START, `2` COMMIT, `3` ABORT. Other values -> code 8. |
+| `0x0003` | `melody_chunk` | CHAR_STRING (0x42) | WRITE_ONLY | Append a chunk to the open staging session. Length 1..79. |
 
-```
-melody  := ws? token ( ws token )* ws?
-token   := note | rest
-note    := letter sharp? octave ':' duration
-letter  := 'A'..'G' | 'a'..'g'          (case-insensitive)
-sharp   := '#'                          (only C#, D#, F#, G#, A#; E# and B# are invalid)
-octave  := '3'..'6'
-rest    := 'R' ':' duration | 'r' ':' duration
-duration:= 1..4 decimal digits (no sign), value 10..2000 (ms)
-ws      := 1*(' ')
-```
+| Cmd | Name | Payload | Effect |
+|---|---|---|---|
+| `0x00` | `play` | none | Play ACTIVE if committed, else DEFAULT. |
 
-Notes: no flats (`b`). Duration = ms the tone (note) or silence (rest) lasts.
+### 3.1 `melody` 0x0000 single-shot write (backward-compatible path)
+- Length 0 -> **clear**: ACTIVE becomes "none" (DEFAULT plays). Success.
+- Length 1..300 -> parse; success replaces ACTIVE; failure keeps ACTIVE, sets `last_error`.
+- Length >300 or declared length larger than available data -> code 1.
+- Does NOT touch the staging session (section 4).
 
-**Default melody** (must equal current fixed tune exactly, 88 chars):
-```
-E5:120 R:30 E5:120 R:150 E5:120 R:150 C5:120 R:30 E5:120 R:150 G5:120 R:350 G4:120 R:350
-```
-Mapping to current code: E5 120 / delay 30 / E5 120 / delay 150 / E5 120 / delay 150 / C5 120 / delay 30 / E5 120 / delay 150 / G5 120 / delay 350 / G4 120 / delay 350.
+### 3.2 Chunked upload protocol (sequential writes)
+Sequence for a new melody:
+1. Write `melody_ctrl = 1` (START): staging cleared, session OPEN, `last_error = 0`.
+2. Write `melody_chunk = <part>` for each part, each 1..79 chars, in order, concatenated raw (no separator added; a split may fall inside a token).
+3. Write `melody_ctrl = 2` (COMMIT).
 
-## 5. Bounds
-| Limit | Value | Constant |
+Rules:
+- Staging is capped at `MELODY_MAX_TEXT` (300) total bytes.
+- Chunk when session IDLE -> code 7. Session-state validation takes precedence over chunk length, so an empty chunk in IDLE is also code 7.
+- Chunk length 0 or >79 -> code 1, session -> FAILED (staging discarded; `last_error` = 1).
+- Chunk that would exceed 300 total -> code 1, session -> FAILED.
+- Chunk while session FAILED -> code 7 (session unchanged, staging stays discarded).
+- START always resets to OPEN with empty staging and `last_error = 0` (also from FAILED: this is the recovery path).
+- ABORT: staging discarded, session IDLE, `last_error` **unchanged** (so the converter can still read the failure code). If a completed COMMIT result is cached, ABORT leaves that cache intact because there is no open upload to abort.
+- COMMIT:
+  - Session IDLE with no cached result -> code 7.
+  - Session FAILED -> return stored failure code (already in `last_error`); session -> IDLE; ACTIVE unchanged. **Empty commit is NOT a clear in this case** (incompatible with failed upload).
+  - Session OPEN, staged length 0 -> **clear**: ACTIVE becomes none, DEFAULT plays. `last_error = 0`. Session -> IDLE. (Decision from v2 open question: empty commit clears custom active without reboot.)
+  - Session OPEN, staged length > 0 -> `melody_parse` the whole staging; OK -> ACTIVE replaced, `last_error = 0`; error -> ACTIVE unchanged, `last_error = code`. Session -> IDLE in both cases (retry requires START).
+  - A repeated COMMIT after a completed COMMIT returns the cached result and does not apply changes again. START clears this cache to make retransmitted commit requests idempotent.
+- Unknown `melody_ctrl` value -> code 8, session unchanged.
+- A chunk arriving with no START is always rejected; no implicit start.
+
+Sessions are not timed out in v2; an open session remains until START, COMMIT, or ABORT.
+
+### 3.3 Why attributes, not commands with payload
+Attribute writes are acknowledged per write, so Z2M can await each step in order; this matches the existing `melody` write path. Commands with payload were considered (SDK supports `data.size/value`) but they need new Z2M command-parameter typing and were rejected for v2.
+
+## 4. Melody state model (firmware)
+
+Two melody slots + one staging buffer:
+
+| Name | Where | Lifetime |
 |---|---|---|
-| Max text length | 120 chars (fits ZCL char string) | `MELODY_MAX_TEXT` |
-| Max tokens | 24 | `MELODY_MAX_STEPS` |
-| Duration per token | 10..2000 ms | `MELODY_MIN_MS`, `MELODY_MAX_MS` |
-| Total playback time | <= 15000 ms (sum of durations) | `MELODY_MAX_TOTAL_MS` (assumption, tune if needed) |
-| Octave | 3..6 | |
+| `s_default_melody` (`melody_t`) | parsed once in `app_main` from `DEFAULT_MELODY`; read-only after boot; no mutex needed | RAM, constant |
+| `s_active_melody` (`melody_t`) + `s_active_custom` (bool) + `s_active_melody_text[301]` | committed custom melody; `s_active_custom == false` = none | RAM, reset at boot |
+| staging (`melody_upload_t`, pure-C, section 5) | open upload session | RAM, Zigbee task only |
+| `s_melody_attr[256]`, `s_melody_last_error` | ZCL-visible state | RAM |
 
-Frequency: equal temperament, A4=440 Hz, rounded. Hardcode a 4x12 table (octaves 3..6, semitones C..B) in `melody_parser.c`. Octave 4 = 262,277,294,311,330,349,370,392,415,440,466,494; other octaves = x2 / x0.5 with rounding. Must yield E5=659, C5=523, G5=784, G4=392. Rest = frequency 0.
+- `s_active_*`, `s_melody_attr`, `s_melody_last_error`, and the complete staging-session state/buffer are accessed only under `s_melody_mutex`.
+- Staging currently originates in `zb_attribute_handler` (Zigbee task), but it still uses the shared melody mutex as required; do not rely on Zigbee-task serialization as its sole protection.
+- Boot: `s_active_custom = false`, staging IDLE, `last_error = 0`, `s_melody_attr` = DEFAULT text. Nothing is persisted (no NVS).
+- Migration: v1 had no `s_active_custom`; v1 active always existed (default at boot). In v2 "active" means "custom committed"; default is a separate constant. Remove v1 behaviour where On/Off played `s_active_melody`.
 
-## 6. Parser and error codes
-- New pure-C module `main/melody_parser.h/.c` (NO ESP-IDF includes, no logging) so it can be built on host for tests.
-- API (suggested):
-  ```c
-  typedef struct { uint16_t freq_hz; uint16_t duration_ms; } melody_step_t; // freq 0 = rest
-  typedef struct { melody_step_t steps[MELODY_MAX_STEPS]; uint8_t count; uint32_t total_ms; } melody_t;
-  uint8_t melody_parse(const char *text, size_t len, melody_t *out); // returns 0 OK or error code
-  ```
-- Parse into a local `melody_t`; only on success copy into the shared active melody (atomic replacement). Failed write never changes the active melody.
+## 5. New pure-C module: upload session (host-testable)
 
-| Code | Meaning |
-|---|---|
-| 0 | OK |
-| 1 | Length 0 or > 120 |
-| 2 | Syntax error (bad char, missing ':', bad token) |
-| 3 | Token count 0 or > 24 |
-| 4 | Duration out of 10..2000 |
-| 5 | Invalid note (octave not 3..6, E#/B#) |
-| 6 | Total duration > 15000 ms |
+Files: `main/melody_upload.h`, `main/melody_upload.c` (NO ESP includes, no logging). Include guard `MELODY_UPLOAD_H`.
 
-Order: length -> syntax/token scan -> counts/ranges -> total.
+```c
+#define MELODY_CHUNK_MAX 79            /* max bytes per melody_chunk write, <80 */
+typedef enum { MELODY_UPLOAD_IDLE, MELODY_UPLOAD_OPEN, MELODY_UPLOAD_FAILED } melody_upload_state_t;
+typedef struct {
+    melody_upload_state_t state;
+    uint8_t len;                       /* staged bytes, 0..MELODY_MAX_TEXT */
+    char text[MELODY_MAX_TEXT + 1];
+    melody_error_t error;              /* code stored when FAILED */
+    bool has_commit_result;             /* duplicate COMMIT response cache */
+    melody_error_t commit_result;
+} melody_upload_t;
 
-## 7. Task synchronization
-- Shared state: `s_melody` (`melody_t`) + `s_melody_attr` (ZCL string buffer) + `s_melody_last_error`, guarded by new `s_melody_mutex` (`xSemaphoreCreateMutex()` in `app_main`, next to `s_sensor_data_mutex`).
-- Writer (Zigbee task, `zb_attribute_handler`): copy bounded payload to local buffer -> parse (no mutex) -> take `s_melody_mutex` -> copy struct + canonical string attr + error -> give. Invalid writes restore the last valid string and update the error under the same mutex. A ZCL char string can contain at most 255 bytes plus a length prefix, so the backing ZCL buffer is 256 bytes even though accepted melody text is limited to 120.
-- Playback (`buzzer_task`): on each wake, take mutex, `memcpy` active melody into a local `melody_t` snapshot, give mutex, play snapshot. Playback never reads shared state after snapshot. Writes during playback affect the NEXT trigger.
-- Trigger coalescing: keep current `xTaskNotify`/`ulTaskNotifyTake` pattern (one pending replay max). Both On/Off and `play` command call `buzzer_play_melody_async()`.
-- No Zigbee API calls from `buzzer_task`. Keep `esp_zb_lock` out of buzzer code.
-- Keep `buzzer_task` stack at 2048 unless high-water mark (`uxTaskGetStackHighWaterMark`) shows less than ~512 bytes free; then raise to 3072.
+typedef enum { MELODY_CTRL_START = 1, MELODY_CTRL_COMMIT = 2, MELODY_CTRL_ABORT = 3 } melody_ctrl_t;
 
-## 8. Playback
-- `buzzer_play_snapshot(const melody_t *m)`: for each step: if `freq_hz == 0` -> `ledc duty 0`, `vTaskDelay(duration)`; else `buzzer_tone(freq_hz, duration_ms)` (existing function, unchanged).
-- Keep `buzzer_init()` and LEDC config unchanged.
-- Replace the hard-coded sequence in `buzzer_task` by the snapshot playback; the default melody is the parsed default string (section 4), initialized at boot (`melody_parse(DEFAULT_MELODY, ...)` in `app_main` before the buzzer task starts, or static precomputed table).
-
-## 9. Zigbee implementation changes (esp_zb_light.c / esp_zb_light.h)
-1. Endpoint 10: stop using `esp_zb_on_off_light_ep_create` for ep 10 OR keep it and verify a way to append a cluster. Preferred: build ep 10 manually like eps 11/12:
-   - `esp_zb_cluster_list_t` with basic, identify, groups, scenes, `esp_zb_on_off_cluster_create(&on_off_cfg)`, and the melody custom cluster. Preserve all standard clusters/config from `ESP_ZB_DEFAULT_ON_OFF_LIGHT_CONFIG()` so the existing endpoint remains equivalent.
-   - Endpoint config: `app_profile_id = ESP_ZB_AF_HA_PROFILE_ID`, `app_device_id = ESP_ZB_HA_ON_OFF_LIGHT_DEVICE_ID`, `app_device_version = 0`, endpoint `HA_ESP_LIGHT_ENDPOINT`.
-   - Melody cluster: `esp_zb_zcl_attr_list_create(MELODY_CLUSTER_ID)`; `esp_zb_cluster_add_attr` for 0x0000 (CHAR_STRING, READ|WRITE, pointer to static `s_melody_attr`) and 0x0001 (U8, READ_ONLY, `&s_melody_last_error`); then `esp_zb_cluster_list_add_custom_cluster(cl, attr, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE)`.
-   - Must keep `esp_zcl_utility_add_ep_basic_manufacturer_info(ep_list, HA_ESP_LIGHT_ENDPOINT, &info)`.
-2. `zb_attribute_handler`: keep On/Off branch exactly. Add branch for `cluster == MELODY_CLUSTER_ID`, `attribute.id == 0x0000`: copy string value (verify length prefix), call `melody_set_from_zigbee()` (parse + store + update last_error). Return ESP_OK on success; on failure return error and keep old melody.
-3. `zb_action_handler`: add `case ESP_ZB_CORE_CMD_CUSTOM_CLUSTER_REQ_CB_ID`: if `cluster == MELODY_CLUSTER_ID && command == 0x00 && dst_endpoint == HA_ESP_LIGHT_ENDPOINT` -> `buzzer_play_melody_async()`. Verify struct `esp_zb_zcl_custom_cluster_command_message_t` field names in `zcl/esp_zigbee_zcl_command.h`.
- 4. Do not change endpoints 11/12, reporting configuration thresholds, button logic, display, or sensor tasks. Preserve the auto-rejoin watchdog while avoiding a nested Zigbee lock: report helpers run under the lock already, and LED feedback must occur after that lock is released.
-
-## 10. Edge cases and error handling
-- Write with invalid text -> old melody kept, last_error set, log `ESP_LOGW` with code. Never play a partially parsed melody.
-- Empty string write -> code 1.
-- Write while playing -> applies to next trigger; current playback continues with snapshot.
-- Multiple triggers during playback -> one pending replay (same as today).
-- Rejoin/leave/factory reset: active melody is RAM only; after reboot default melody returns. (Assumption: no NVS persistence in v1.)
-- Non-UTF/ non-ASCII bytes -> syntax error (code 2).
-- Length-prefix mismatch (declared length > `data.size - 1`) -> code 1.
-- Parser must not index beyond `len`; no `strtol` on unbounded strings; use manual digit loop with overflow guard (max 4 digits).
-- On/Off write behaviour unchanged: any On/Off write plays current melody (= default unless changed).
-
-## 11. Security considerations
-- Zigbee network-level security unchanged (install-code policy from `INSTALLCODE_POLICY_ENABLE` as today). Any joined device can write the melody; accepted risk (buzzer only, no actuator of consequence). Document it.
-- Bounded buffers only; no dynamic allocation in parser; all lengths checked before copy.
-
-## 12. Z2M external converter (new file, e.g. `z2m/esp32c6_melody.js`)
-Target: Z2M external converter ES module (`z2m/esp32c6_melody.mjs`). It uses the documented zigbee-herdsman device API; behavior still needs on-device confirmation with the user's Z2M version.
-- Fingerprint: `manufacturerName: 'ESPRESSIF'`, `modelID: 'esp32c6'`. Adjust if the device reports different values (check Z2M "Device not supported" log).
-- Register the cluster with `device.addCustomCluster('melodyCluster', definition)` in `configure`. Include cluster, attribute and command names; use numeric Herdsman ZCL types (CHAR_STR `0x42`, UINT8 `0x20`) and mark melody writable.
-- Exposes:
-  - `text` `melody` (access `ALL`: state, set and get), description with grammar summary.
-  - `enum` `melody_play` values `['PLAY']`, access SET (fires `play` command).
-  - `numeric` `melody_error` 0..6, access `STATE_GET`, with a toZigbee read handler.
-- toZigbee:
-  - `melody`: `entity.write('melodyCluster', { melody: value })`; return `{ state: { melody: value } }`. Client-side length check (<=120) to fail fast.
-  - `melody_play`: `entity.command('melodyCluster', 'play', {}, options)`; return no state.
-- fromZigbee: handle `melodyCluster` `melody` and `last_error` attributes -> state keys `melody`, `melody_error`. Also handle the on/off as today (Z2M default).
-- Endpoint: `endpoint: (device) => ({ default: 10 })` (or rely on default ep 10 of On/Off; verify).
-- `configure`: register the custom cluster; no reporting configuration is needed because attributes can be read on demand.
-
-Usage example:
+void melody_upload_reset(melody_upload_t *u);                              /* IDLE, empty */
+melody_error_t melody_upload_start(melody_upload_t *u);                    /* OPEN, staging empty, error 0 */
+melody_error_t melody_upload_append(melody_upload_t *u, const char *chunk, size_t len);
+void melody_upload_abort(melody_upload_t *u);                              /* IDLE, staging empty, error kept */
+/* COMMIT: parses staging internally. out_clear is required; NULL returns LENGTH
+ * without consuming the session. For nonempty OPEN staging, out_melody is required;
+ * NULL returns LENGTH without consuming the session. Outputs are written only on success/clear.
+ * Returns MELODY_ERROR_OK with *out_clear = true for empty OPEN commit (caller sets ACTIVE none).
+ * Returns MELODY_ERROR_OK with *out_clear = false and *out_melody filled for valid text.
+ * Returns error code otherwise; *out_melody untouched. Valid commits close the session;
+ * retries return the cached result without rewriting out_melody. */
+melody_error_t melody_upload_commit(melody_upload_t *u, melody_t *out_melody, bool *out_clear);
+melody_error_t melody_upload_control(melody_upload_t *u, uint8_t control,
+                                     melody_t *out_melody, bool *out_clear);
 ```
-zigbee2mqtt/<name>/set  {"melody":"C5:150 R:50 E5:150 G5:300"}
-zigbee2mqtt/<name>/set  {"melody_play":"PLAY"}
-```
-Send as two messages (ordering inside a single message not guaranteed; verify).
-After flashing: Z2M must re-interview the device (Z2M UI "Reconfigure"/"Interview", or re-pair) so it learns the new cluster 0xFC00 on endpoint 10.
+- Error codes reuse `melody_error_t` extended with `MELODY_ERROR_SEQUENCE = 7` and `MELODY_ERROR_UNKNOWN_OP = 8` (add to `melody_parser.h` enum).
+- `melody_upload_fail()` is an internal helper in `melody_upload.c`; it is not part of the public upload-session API.
+- Control dispatch (`melody_ctrl` 1/2/3 -> START/COMMIT/ABORT, other -> code 8) is implemented by `melody_upload_control()`.
+- Append never reads beyond `len`; uses `memcpy` only after bounds checks.
+
+## 6. Error codes (sync with converter)
+| Code | Name | Meaning |
+|---|---|---|
+| 0 | OK | success |
+| 1 | LENGTH | single write >300; chunk length 0 or >79; staged total >300; empty chunk |
+| 2 | SYNTAX | bad char, missing `:`, bad token |
+| 3 | STEP_COUNT | 0 or >24 tokens |
+| 4 | DURATION | duration not 10..2000 |
+| 5 | NOTE | octave not 3..6, E#/B#, flats |
+| 6 | TOTAL_DURATION | total > 15000 ms |
+| 7 | SEQUENCE | chunk/initial commit without START; chunk after FAILED; commit after ABORT when no completed-COMMIT result is cached |
+| 8 | UNKNOWN_OP | `melody_ctrl` value not 1..3 |
+
+v1 code 7 ("mutex contention") is **dropped**; the mutex is taken with `portMAX_DELAY` as today, so no busy code is needed. Parser order unchanged: length -> syntax/token scan -> counts/ranges -> total.
+
+## 7. Task synchronization and playback
+
+- Notification with value: replace `xTaskNotify(h, 0, eNoAction)` with
+  `xTaskNotify(h, src, eSetValueWithOverwrite)` where `src = PLAY_SRC_DEFAULT (0)` or `PLAY_SRC_ACTIVE (1)`.
+  - On/Off -> `PLAY_SRC_DEFAULT`.
+  - `play` cmd -> `PLAY_SRC_ACTIVE`.
+  - Coalescing: at most one pending request; latest source wins (**decision**).
+- `buzzer_task`: `xTaskNotifyWait(0, ULONG_MAX, &src, portMAX_DELAY)`, then:
+  - `PLAY_SRC_DEFAULT`: play `s_default_melody` (no mutex needed; constant).
+  - `PLAY_SRC_ACTIVE`: under `s_melody_mutex` copy `s_active_melody` to a local snapshot if `s_active_custom`, else use default; release; play snapshot.
+- Playback never reads shared state after the snapshot. Writes during playback affect the next trigger.
+- Stack for `buzzer_task` stays 2048; raise to 3072 only if `uxTaskGetStackHighWaterMark` < ~512 bytes.
+- No Zigbee API calls from buzzer code.
+
+## 8. Playback helpers (unchanged)
+- `buzzer_play_snapshot(const melody_t *m)`: `freq 0` -> `buzzer_silence(ms)`, else `buzzer_tone(freq, ms)`.
+- `buzzer_init()` and LEDC config unchanged.
+
+## 9. Zigbee implementation changes (`main/esp_zb_light.c`, `main/esp_zb_light.h`)
+1. `esp_zb_light.h`: add defines/comments for `MELODY_ATTR_*` IDs `0x0002` (`MELODY_CTRL_ATTR_ID`), `0x0003` (`MELODY_CHUNK_ATTR_ID`) next to `MELODY_CLUSTER_ID`. Keep `MELODY_CLUSTER_ID`.
+2. `esp_zb_task()` endpoint 10 custom cluster: add
+   - `0x0002` U8, `ESP_ZB_ZCL_ATTR_ACCESS_WRITE_ONLY`, backing `s_melody_ctrl_value` (static uint8_t).
+   - `0x0003` CHAR_STRING, `ESP_ZB_ZCL_ATTR_ACCESS_WRITE_ONLY`, backing `s_melody_chunk_attr[256]` (static; stack stores pointers).
+   - keep `0x0000` (READ_WRITE, `s_melody_attr`) and `0x0001` (READ_ONLY, `&s_melody_last_error`).
+   - Keep endpoint 10 setup otherwise unchanged.
+3. `zb_attribute_handler()`: keep On/Off branch but change `buzzer_play_melody_async()` to `buzzer_play_melody_async(PLAY_SRC_DEFAULT)`. Melody branch dispatch by `attribute.id`:
+   - `0x0000` -> `melody_single_write()` (3.1).
+   - `0x0002` -> `melody_ctrl_write()` -> `melody_upload_control` (START/ABORT) or COMMIT path (copy staged text before commit clears it; apply under mutex).
+   - `0x0003` -> `melody_chunk_write()` -> `melody_upload_append` under `s_melody_mutex`.
+   - Verify CHAR_STRING type and `data.size >= 1` before reading `value[0]`; declared length `value[0] <= data.size - 1`.
+   - Each handler returns `ESP_OK` on success, `ESP_ERR_INVALID_ARG` on any melody error (so the Zigbee default response reports failure); always set `s_melody_last_error` (under mutex) before returning.
+   - U8 ctrl value read from `message->attribute.data.value` (type U8, `data.size == 1`).
+4. `zb_action_handler()` `ESP_ZB_CORE_CMD_CUSTOM_CLUSTER_REQ_CB_ID`: `cmd 0x00` -> `buzzer_play_melody_async(PLAY_SRC_ACTIVE)`. Keep endpoint/cluster checks.
+5. `melody_set_error()`/`melody_attribute_write()` replaced by: `melody_refresh_attr_locked()` (rebuild `s_melody_attr` from ACTIVE-or-DEFAULT text) and the handlers above. Under `s_melody_mutex` every change to `s_active_*`, `s_melody_attr`, `s_melody_last_error` must be followed by a `melody_refresh_attr_locked()`.
+6. `app_main()`: parse `DEFAULT_MELODY` into `s_default_melody` (not `s_active_melody`); set `s_active_custom = false`; `melody_upload_reset(&s_upload)`; `s_melody_attr` = default text; `s_melody_last_error = 0`. Create `s_melody_mutex` before use (already the case).
+7. Do not change endpoints 11/12, reporting, button, display, sensors, auto-rejoin, or `esp_zb_lock` usage. Zigbee stack calls stay in `esp_zb_lock_*` (attribute writes are already inside stack callbacks).
+
+## 10. Z2M external converter (`z2m/esp32c6_melody.mjs`, mirror to server `data/external_converters/esp32c6_melody.mjs`)
+- `melodyCluster.attributes`: add `melody_ctrl: {ID: 0x0002, type: 0x20, write: true}` and `melody_chunk: {ID: 0x0003, type: 0x42, write: true}`. Keep `melody` (`write: true`) and `last_error` (0x20). Keep `play` command.
+- Chunk split constant `CHUNK_MAX = 48` (firmware accepts up to 79; converter stays lower, see section 11); `MELODY_MAX = 300`.
+- `tzMelody.convertSet(entity, key, value, meta)`, value string:
+  1. Client checks: string type; length 0..300; ASCII printable only (`/^[\x20-\x7e]*$/`). Throw on failure before any write (no code sent).
+  2. Split into chunks of <= 48 chars in order (empty value -> zero chunks).
+  3. **Sequentially, each awaited**: `write({melody_ctrl: 1})`; for each chunk `write({melody_chunk: chunk})`; `write({melody_ctrl: 2})`.
+   4. On any write failure: best effort `write({melody_ctrl: 3})` (ABORT), then `read(['last_error'])`, then throw an upload error. Do not retry chunks (duplicate risk, see section 11).
+   5. After a successful COMMIT write, read `last_error`; Herdsman returns a key/value object (e.g. `{last_error: 0}`). Throw with the reported code if nonzero. This detects a rejected parse/commit even if a write response was accepted. The read response also updates the exposed `melody_error` state, including clearing stale errors after success.
+   6. If status read fails after all writes were acknowledged, preserve the write result and return `{state: {melody: value}}`; the diagnostic read is best effort.
+- `tzMelody.convertGet`: read `melody`.
+- `fzMelody`: unchanged mapping (`melody`, `last_error` -> `melody_error`). Also map report/read of `melody_ctrl`? No (write-only, do not map).
+- `tzMelodyPlay`: unchanged (`command('melodyCluster','play')`).
+- `tzMelodyError`: unchanged.
+- Exposes: update `melody` description: "up to 300 chars, sent in 79-char chunks; empty value clears to default". Keep `melody_play` and `melody_error`.
+- `configure`: `device.addCustomCluster('melodyCluster', melodyCluster)` (unchanged); **re-run after updating** so new attribute IDs are known.
+- ASSUMPTION: Herdsman accepts writes to attributes with `write: true` and surfaces a ZCL failure status as a rejected promise. Verify on the user's Z2M version (`docker logs -n 200 zigbee2mqtt`).
+- Keep the `UNSUPPORTED_CLUSTER melodyCluster` known gotcha documented.
+
+## 11. Edge cases and error handling
+- Converter sends chunks sequentially; each write awaits the default response, so chunk order is preserved.
+- **Converter chunk size is 48 chars** (`MELODY_CHUNK_MAX` in the .mjs). Field test: a 79-char chunk failed with `ApsDataRequest failed with status: InvalidValue` (ZCL/APS/NWK overhead exceeds the frame payload). The firmware still accepts 1..79 per chunk; the converter stays lower for margin.
+- Zigbee retransmission could duplicate a chunk (no sequence index in v2): result would be a wrong melody that still parses or fails with code 2-6. **Accepted v2 limitation**; mitigated by the parser and by the user re-sending. Duplicate COMMIT requests are idempotent.
+- Chunk split inside a token is allowed; only the concatenated text is validated.
+- Write while playing -> applies to the next trigger (snapshot).
+- Multiple triggers during playback -> one pending replay (latest source wins).
+- Invalid text never plays partially; never replaces ACTIVE.
+- Reboot / rejoin / leave: staging and ACTIVE reset at boot (`s_active_custom = false`); a leave does not clear ACTIVE (RAM only; **decision**: only reboot clears).
+- Factory reset: device reboots -> ACTIVE reset to default.
+- Non-ASCII bytes -> code 2 (device); converter rejects client-side first.
+- Declared CHAR_STRING length mismatch -> code 1.
+- `melody_ctrl` with a non-U8 or incorrectly sized value -> code 1; a malformed/empty chunk in an OPEN session -> code 1 and the session becomes FAILED.
+- No `strtol`; no dynamic allocation in parser or session; all lengths checked before copy.
+- On/Off write behaviour: any On/Off write plays DEFAULT (**changed from v1**, where it played active).
+
+## 12. Tests
+
+### 12.1 Host parser tests (`test/host/test_melody_parser.c`) - keep v1 cases, add:
+- Error code 7/8 are not produced by the parser (regression guard).
+- Existing cases unchanged (default = 14 steps, total 2050, freqs 659/523/784/392, boundary tokens, 300-char max, 301 -> LENGTH, etc.).
+
+### 12.2 Host upload-session tests (NEW `test/host/test_melody_upload.c`, compile with `main/melody_parser.c main/melody_upload.c`):
+- START -> append "C5:100 " (7 chars) -> append "E5:100" -> COMMIT -> OK, staged text equals concatenation, parse result equals single `melody_parse` of the whole string.
+- Chunk exactly 79 chars OK; 80 chars -> LENGTH (1) and session FAILED.
+- Chunk length 0 -> LENGTH (1).
+- Staged total 300 OK; 301st byte -> LENGTH (1), session FAILED.
+- Append while IDLE -> SEQUENCE (7); append while FAILED -> SEQUENCE (7), staging stays empty.
+- Empty append while IDLE -> SEQUENCE (7); session error precedes chunk-length validation.
+- COMMIT in initial IDLE -> SEQUENCE (7).
+- Duplicate COMMIT after a successful/failed commit returns the cached result and does not change ACTIVE again.
+- START from FAILED -> OPEN, `error` cleared, staging empty.
+- START twice -> staging reset (no concatenation of old data).
+- ABORT from OPEN -> IDLE, staging empty, error code unchanged.
+- ABORT from FAILED -> IDLE, staging empty, failed chunk error preserved; a later COMMIT is a sequence error.
+- ctrl value 0, 4, 255 -> UNKNOWN_OP (8), state unchanged.
+- COMMIT OPEN + empty staging -> clear signal, no parse error, session IDLE.
+- COMMIT FAILED -> returns stored code, session IDLE, clear signal **false**.
+- COMMIT OPEN + invalid text (e.g. `C5:9`) -> DURATION (4), ACTIVE output untouched (caller contract), session IDLE.
+- COMMIT with a missing required output pointer -> LENGTH (1), staging/session unchanged.
+- Upload result equal to single-shot parse for every valid vector in 12.1 (split at every position for the default melody).
+- Run with `-fsanitize=address,undefined`.
+
+### 12.3 On-device manual checklist (ESP32-C6, Z2M):
+1. Flash; factory-new join; Z2M interview shows `melody`, `melody_play`, `melody_error`; reconfigure after converter update.
+2. Toggle On/Off in HA -> DEFAULT melody plays (even after a custom melody was committed).
+3. Set a melody of 100 chars via converter (2 chunks) -> `melody_error` 0; `play` -> custom melody plays.
+4. Set melody with bad token -> converter throws with code; previous ACTIVE still plays on `play`.
+5. Empty `melody` value -> `play` plays DEFAULT; `melody` read returns default text.
+6. Single-shot `melody` writes still accept up to 300 chars; the converter uses chunked writes to avoid coordinator transport limits.
+7. Chunk without START (manual MQTT/zcl) -> code 7.
+8. Spam `play` 10x -> at most one replay after current playback.
+9. Reboot -> ACTIVE gone, `play` plays DEFAULT.
+10. CO2/PM2.5 reporting, display, button, auto-rejoin unchanged.
+11. Temporary: log `buzzer_task` stack high-water mark once.
+
+### 12.4 Build
+- `idf.py build` (via VS Code ESP-IDF extension Build button) must succeed; no new warnings in `melody_upload.c`.
 
 ## 13. Documentation changes
 - `README.md`:
-  - Zigbee table: endpoint 10 row add "custom cluster 0xFC00: melody text (0x0000), last_error (0x0001), play cmd (0x00)".
-  - Buzzer section: grammar, bounds, default melody, error codes, On/Off behaviour, RAM-only note.
-  - Add Z2M usage section (set melody, trigger, re-interview requirement) and converter file path.
-  - Keep existing functions list intact.
-- Do not change unrelated README sections.
-- Add comments in `esp_zb_light.h` for `MELODY_CLUSTER_ID` and limits.
+  - Zigbee table, endpoint 10 row: add attrs `0x0002` ctrl, `0x0003` chunk.
+  - Buzzer section: On/Off plays DEFAULT (replace "when a custom tune is set, On/Off plays that tune"); `play` plays custom-or-default; chunk upload protocol (START/chunks/COMMIT, <=79-char chunks, 300 total); empty commit clears; error codes 0-8; RAM-only note; replace the existing "approximately 80 characters" paragraph by the chunk rule.
+  - Z2M section: converter re-install + reconfigure requirement after this change.
+  - Keep unrelated sections intact.
+- `MELODY_HELP.md`: replace the single-write example with the chunked flow (or describe that the converter does it); update error table to 0-8; update "On/Off" semantics if mentioned (currently not mentioned explicitly - keep it accurate); keep the `UNSUPPORTED_CLUSTER` note.
+- `AGENTS.md`: keep its host-test commands and error-code guidance aligned with the added upload module (run parser and upload tests as separate host executables).
+- `z2m/esp32c6_melody.mjs`: source of truth; copy to server path (manual step, not done by the agent).
 
-## 14. Tests
-Host tests (no hardware), e.g. `test/host/test_melody_parser.c` compiled with gcc (not part of ESP build):
-- Default string parses to 14 steps, total_ms = 2050 (7x120 tone + 1210 rest), exact freqs (E5=659, C5=523, G5=784, G4=392).
-- Valid: lowercase, sharps (`C#5:100`), rests `r:50`, leading/trailing spaces, 24 tokens, 2000 ms, 10 ms.
-- Invalid: empty, only spaces, 121 chars, >24 tokens (length takes precedence because 25 shortest tokens exceed 120 chars), duration 9 / 2001 / 12345, octave 2 / 7, `E#4:100`, `B#4:100`, tab, comma, `C5` (missing duration), `C5:` , `:100`, `X5:100`, total > 15000.
-- No out-of-bounds reads for truncated input (run with `-fsanitize=address,undefined`).
+## 14. Migration
+- Firmware v1 -> v2:
+  - On/Off behaviour changes from "active" to "DEFAULT". Users who relied on On/Off playing a custom tune must use `play` instead.
+  - `melody` 0x0000 still accepts up to 300 characters for backward compatibility; the updated converter uses ordered chunks for all melody messages.
+  - `melody` read now returns the effective text (custom or default) instead of always the last active text; at boot it is the default text (same as v1).
+  - New attributes `0x0002`, `0x0003`; existing `0x0000`, `0x0001`, cmd `0x00` IDs unchanged.
+- Z2M: install converter v2 (both copies), restart Z2M, **reconfigure device** so the new attributes are registered.
+- Old converter (v1) still uses one-shot writes and supports up to 300 characters at the firmware parser. Use the updated converter's chunks for melodies whose single ZCL write may exceed coordinator transport limits; only writes over 300 characters fail with code 1.
+- No NVS schema or flash changes.
 
-On-device manual tests (checklist):
-1. Flash, factory-new join, Z2M interview shows `melody`, `melody_play`, `melody_error`.
-2. Toggle On/Off in HA -> default melody plays (same as before).
-3. Set valid melody, press play -> custom melody plays; On/Off now plays custom melody.
-4. Set invalid text -> `melody_error` != 0, previous melody still plays on trigger.
-5. Spam play 10x during playback -> at most one replay after current finishes.
-6. Sensors CO2/PM2.5 still report; display and button functions unchanged.
-7. `buzzer_task` stack high-water mark logged once (temporary).
+## 15. Security considerations
+- Out of scope per owner instruction. Behaviour unchanged: any joined device can write melody attrs and trigger the buzzer (accepted risk).
+- Still required: bounded buffers, length checks before copy, no dynamic allocation in parser/session.
 
-## 15. Acceptance criteria
-- Default behaviour (no set) audibly identical to pre-change firmware.
-- Custom melody can be set from Z2M text field and played via `melody_play` button; On/Off also uses it.
-- Invalid melody never plays partially and never replaces the active melody.
-- All grammar/bounds in section 4/5 enforced; parser error codes 1–6 are covered by host tests. Code 7 is an integration-time mutex contention status, outside the pure parser.
-- No change to endpoints 11/12, sensors, button, display, auto-rejoin, GPIO20/LEDC config.
-- Build passes with `idf.py build` (ESP-IDF, ESP32-C6 target); no new warnings in new files.
-- README and Z2M converter updated.
+## 16. Acceptance criteria
+- On/Off always plays the DEFAULT melody, regardless of any custom melody.
+- `play` plays the committed custom melody, or DEFAULT if none is committed.
+- Chunk writes are each 1..79 chars; total staged <= 300; START/chunk/COMMIT flow works from Z2M with sequential awaited writes.
+- A failed upload never changes ACTIVE and never plays partially.
+- Empty COMMIT (after START, no chunks) clears ACTIVE to DEFAULT without reboot; empty COMMIT after a failed upload is rejected with the stored code.
+- Reboot resets ACTIVE and staging.
+- Error codes 0-8 match README, converter, and tests.
+- Host tests for parser and upload session pass with ASan/UBSan.
+- `idf.py build` passes; endpoints 11/12, sensors, button, display, auto-rejoin unchanged.
+- README, MELODY_HELP.md, and Z2M converter (both copies) updated.
 
-## 16. Decisions and verified implementation details
-1. On/Off plays the currently configured tune; with no write since boot this exactly reproduces the original tune.
-2. Melody storage is RAM-only; no NVS writes are introduced.
-3. Bounds are fixed at the values in section 5.
-4. Zigbee-herdsman documents `device.addCustomCluster(name, clusterDefinition)`; the converter supplies named attrs/commands and numeric ZCL type IDs. Z2M 2.11+ may require enabling external JavaScript converters; exact user installation still requires device validation.
-5. `esp_zb_zcl_custom_cluster_command_message_t` carries cluster, endpoint and command ID through `info`; char-string values include a one-byte length prefix in `attribute.data.value`.
-6. Manual endpoint creation retains Basic, Identify, Groups, Scenes and On/Off server clusters with the default light values before appending the custom cluster.
-7. `melody_parser.{h,c}` is a pure-C module in `main/`, auto-built by `SRC_DIRS "."`; `test/host/test_melody_parser.c` can be compiled independently with a host C compiler.
-8. The existing report-failure watchdog starts network steering while its caller holds the Zigbee lock and performs the double-blink after release; this preserves behavior without recursive lock acquisition or blocking the Zigbee stack during the blink.
-9. The button-task factory-reset call is protected by the Zigbee API lock because it runs outside stack callbacks.
+## 17. Decisions and remaining verification
+Decisions:
+1. Chunk limit 79 chars (`MELODY_CHUNK_MAX`); total 300 (`MELODY_MAX_TEXT`).
+2. Attribute-based chunking (`melody_ctrl` 0x0002, `melody_chunk` 0x0003); commands with payload rejected for v2.
+3. Empty COMMIT after START clears ACTIVE to DEFAULT without reboot; not allowed when the session FAILED (returns stored code).
+4. Single-shot `melody` write up to 300 chars remains accepted for compatibility; empty clears.
+5. On/Off -> DEFAULT always; `play` -> ACTIVE else DEFAULT.
+6. Pending playback: one, latest source wins.
+7. ACTIVE survives BDB leave/rejoin; reset only by reboot / factory reset (RAM).
+8. Error code 7 redefined as SEQUENCE; new code 8 UNKNOWN_OP; v1 "mutex contention" code dropped.
+9. Session state lives in pure-C `melody_upload.{h,c}`; ACTIVE state lives in `esp_zb_light.c` under `s_melody_mutex`.
+10. A completed COMMIT result is cached until START; duplicate COMMIT requests return that result without mutating ACTIVE.
+
+Resolved during implementation:
+- `ESP_ZB_ZCL_ATTR_ACCESS_WRITE_ONLY` is present in the installed SDK.
+- The converter accepts the empty `melody` string and maps it to START + COMMIT with no chunks.
+- Herdsman `Endpoint.read()` resolves to an attribute key/value object, used to inspect `last_error` after commit.
+
+Remaining device verification:
+- Confirm write-failure responses and converter behavior with the user's Z2M/ESP-IDF versions and the physical device.
+- Retransmitted chunks can duplicate because the protocol has no sequence index; accepted v2 limitation.
+- Open staging sessions have no idle timeout in v2.
+</content>

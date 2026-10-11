@@ -25,6 +25,7 @@
 #include "sps30_driver.h"
 #include "ssd1306_display.h"
 #include "melody_parser.h"
+#include "melody_upload.h"
 #include "zcl/esp_zigbee_zcl_pm2_5_measurement.h"
 
 #if !defined ZB_ED_ROLE
@@ -40,19 +41,23 @@
 #define REJOIN_AFTER_FAILURES 5   /* Auto-rejoin after N consecutive report failures */
 
 #define DEFAULT_MELODY "E5:120 R:30 E5:120 R:150 E5:120 R:150 C5:120 R:30 E5:120 R:150 G5:120 R:350 G4:120 R:350"
-#define MELODY_ATTR_ID 0x0000
-#define MELODY_ERROR_ATTR_ID 0x0001
-#define MELODY_PLAY_COMMAND_ID 0x00
+#define PLAY_SRC_DEFAULT 0U
+#define PLAY_SRC_ACTIVE 1U
 
 static const char *TAG = "ESP_ZB_ON_OFF_LIGHT";
 static volatile uint32_t last_interrupt_time = 0;
 static TaskHandle_t buzzer_task_handle = NULL;
 static SemaphoreHandle_t s_melody_mutex = NULL;
+static melody_t s_default_melody;
 static melody_t s_active_melody;
 static char s_active_melody_text[MELODY_MAX_TEXT + 1] = {0};
+static bool s_active_custom = false;
+static melody_upload_t s_melody_upload;
 /* A ZCL char string can carry at most 255 bytes plus its length prefix. */
 static uint8_t s_melody_attr[256] = {0};
 static uint8_t s_melody_last_error = MELODY_ERROR_OK;
+static uint8_t s_melody_ctrl_value = 0;
+static uint8_t s_melody_chunk_attr[256] = {0};
 static TaskHandle_t co2_sensor_task_handle = NULL;
 static TaskHandle_t pm25_sensor_task_handle = NULL;
 static esp_zb_zcl_reporting_info_t co2_reporting_info;
@@ -142,22 +147,32 @@ static void buzzer_play_snapshot(const melody_t *melody)
 
 static void buzzer_task(void *pvParameter)
 {
+    (void)pvParameter;
     while(1) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        uint32_t playback_source = PLAY_SRC_DEFAULT;
+        xTaskNotifyWait(0, UINT32_MAX, &playback_source, portMAX_DELAY);
 
-        melody_t snapshot;
-        if (xSemaphoreTake(s_melody_mutex, portMAX_DELAY) == pdTRUE) {
-            memcpy(&snapshot, &s_active_melody, sizeof(snapshot));
-            xSemaphoreGive(s_melody_mutex);
-            buzzer_play_snapshot(&snapshot);
+        if (playback_source == PLAY_SRC_ACTIVE) {
+            melody_t snapshot;
+            if (xSemaphoreTake(s_melody_mutex, portMAX_DELAY) == pdTRUE) {
+                if (s_active_custom) {
+                    memcpy(&snapshot, &s_active_melody, sizeof(snapshot));
+                } else {
+                    memcpy(&snapshot, &s_default_melody, sizeof(snapshot));
+                }
+                xSemaphoreGive(s_melody_mutex);
+                buzzer_play_snapshot(&snapshot);
+            }
+        } else {
+            buzzer_play_snapshot(&s_default_melody);
         }
     }
 }
 
-static void buzzer_play_melody_async(void)
+static void buzzer_play_melody_async(uint32_t playback_source)
 {
     if(buzzer_task_handle != NULL) {
-        xTaskNotify(buzzer_task_handle, 0, eNoAction);
+        xTaskNotify(buzzer_task_handle, playback_source, eSetValueWithOverwrite);
     }
 }
 
@@ -183,16 +198,17 @@ static void buzzer_init(void)
     ledc_channel_config(&channel_conf);
 }
 
-static void melody_set_error(melody_error_t error)
+/* Caller must hold s_melody_mutex. */
+static void melody_refresh_attr_locked(void)
 {
-    if (xSemaphoreTake(s_melody_mutex, portMAX_DELAY) != pdTRUE) {
-        return;
+    const char *text = s_active_custom ? s_active_melody_text : DEFAULT_MELODY;
+    /* A ZCL char string holds at most 255 bytes; longer melodies read back truncated. */
+    size_t valid_len = strlen(text);
+    if (valid_len > 255) {
+        valid_len = 255;
     }
-    s_melody_last_error = (uint8_t)error;
-    size_t valid_len = strlen(s_active_melody_text);
     s_melody_attr[0] = (uint8_t)valid_len;
-    memcpy(&s_melody_attr[1], s_active_melody_text, valid_len);
-    xSemaphoreGive(s_melody_mutex);
+    memcpy(&s_melody_attr[1], text, valid_len);
 }
 
 /********************* Button Functions **************************/
@@ -628,44 +644,141 @@ static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
     ESP_RETURN_ON_FALSE(esp_zb_bdb_start_top_level_commissioning(mode_mask) == ESP_OK, , TAG, "Failed to start Zigbee commissioning");
 }
 
+static esp_err_t melody_record_error(melody_error_t error)
+{
+    if (xSemaphoreTake(s_melody_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_FAIL;
+    }
+    s_melody_last_error = (uint8_t)error;
+    melody_refresh_attr_locked();
+    xSemaphoreGive(s_melody_mutex);
+    return ESP_ERR_INVALID_ARG;
+}
+
 static esp_err_t melody_attribute_write(const esp_zb_zcl_set_attr_value_message_t *message)
 {
     melody_t parsed;
     melody_error_t error;
     char text[MELODY_MAX_TEXT + 1];
     const uint8_t *zcl_string = message->attribute.data.value;
+    size_t text_len = 0;
 
     if (message->attribute.data.type != ESP_ZB_ZCL_ATTR_TYPE_CHAR_STRING || zcl_string == NULL ||
         message->attribute.data.size < 1) {
-        melody_set_error(MELODY_ERROR_LENGTH);
-        return ESP_ERR_INVALID_ARG;
+        return melody_record_error(MELODY_ERROR_LENGTH);
     }
 
-    size_t text_len = zcl_string[0];
-    if (text_len == 0 || text_len > MELODY_MAX_TEXT || text_len > message->attribute.data.size - 1) {
-        melody_set_error(MELODY_ERROR_LENGTH);
-        return ESP_ERR_INVALID_ARG;
+    text_len = zcl_string[0];
+    if (text_len > MELODY_MAX_TEXT || text_len > message->attribute.data.size - 1) {
+        return melody_record_error(MELODY_ERROR_LENGTH);
     }
+    if (text_len == 0) {
+        if (xSemaphoreTake(s_melody_mutex, portMAX_DELAY) != pdTRUE) {
+            return ESP_FAIL;
+        }
+        s_active_custom = false;
+        s_active_melody_text[0] = '\0';
+        s_melody_last_error = MELODY_ERROR_OK;
+        melody_refresh_attr_locked();
+        xSemaphoreGive(s_melody_mutex);
+        return ESP_OK;
+    }
+
     memcpy(text, &zcl_string[1], text_len);
     text[text_len] = '\0';
-
     error = melody_parse(text, text_len, &parsed);
     if (error != MELODY_ERROR_OK) {
-        melody_set_error(error);
         ESP_LOGW(TAG, "Rejected melody payload (error %u)", (unsigned)error);
-        return ESP_ERR_INVALID_ARG;
+        return melody_record_error(error);
     }
 
-    /* Playback only holds this mutex long enough to copy its melody snapshot. */
     if (xSemaphoreTake(s_melody_mutex, portMAX_DELAY) != pdTRUE) {
         return ESP_FAIL;
     }
     memcpy(&s_active_melody, &parsed, sizeof(parsed));
     memcpy(s_active_melody_text, text, text_len + 1);
-    s_melody_attr[0] = (uint8_t)text_len;
-    memcpy(&s_melody_attr[1], text, text_len);
+    s_active_custom = true;
     s_melody_last_error = MELODY_ERROR_OK;
+    melody_refresh_attr_locked();
     xSemaphoreGive(s_melody_mutex);
+    return ESP_OK;
+}
+
+static esp_err_t melody_ctrl_attribute_write(const esp_zb_zcl_set_attr_value_message_t *message)
+{
+    if (message->attribute.data.type != ESP_ZB_ZCL_ATTR_TYPE_U8 ||
+        message->attribute.data.value == NULL || message->attribute.data.size != sizeof(uint8_t)) {
+        return melody_record_error(MELODY_ERROR_LENGTH);
+    }
+
+    const uint8_t control = *(const uint8_t *)message->attribute.data.value;
+    melody_t parsed;
+    char staged_text[MELODY_MAX_TEXT + 1] = {0};
+    bool clear_active = false;
+    if (xSemaphoreTake(s_melody_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_FAIL;
+    }
+
+    bool duplicate_commit = control == MELODY_CTRL_COMMIT &&
+                            s_melody_upload.state == MELODY_UPLOAD_IDLE &&
+                            s_melody_upload.has_commit_result;
+    if (control == MELODY_CTRL_COMMIT && s_melody_upload.state == MELODY_UPLOAD_OPEN &&
+        s_melody_upload.len > 0) {
+        memcpy(staged_text, s_melody_upload.text, (size_t)s_melody_upload.len + 1);
+    }
+    melody_error_t error = melody_upload_control(&s_melody_upload, control, &parsed, &clear_active);
+    if (error == MELODY_ERROR_OK && control == MELODY_CTRL_COMMIT && !duplicate_commit) {
+        if (clear_active) {
+            s_active_custom = false;
+            s_active_melody_text[0] = '\0';
+        } else {
+            memcpy(&s_active_melody, &parsed, sizeof(parsed));
+            memcpy(s_active_melody_text, staged_text, strlen(staged_text) + 1);
+            s_active_custom = true;
+        }
+    }
+    if (error != MELODY_ERROR_OK) {
+        s_melody_last_error = (uint8_t)error;
+        ESP_LOGW(TAG, "Melody control %u failed (error %u)", (unsigned)control, (unsigned)error);
+    } else if (control == MELODY_CTRL_START) {
+        s_melody_last_error = MELODY_ERROR_OK;
+    } else if (control == MELODY_CTRL_COMMIT) {
+        s_melody_last_error = MELODY_ERROR_OK;
+    }
+    melody_refresh_attr_locked();
+    xSemaphoreGive(s_melody_mutex);
+    return error == MELODY_ERROR_OK ? ESP_OK : ESP_ERR_INVALID_ARG;
+}
+
+static esp_err_t melody_chunk_attribute_write(const esp_zb_zcl_set_attr_value_message_t *message)
+{
+    const uint8_t *zcl_string = message->attribute.data.value;
+    size_t chunk_len = 0;
+    const char *chunk = NULL;
+    melody_error_t error;
+
+    if (message->attribute.data.type != ESP_ZB_ZCL_ATTR_TYPE_CHAR_STRING || zcl_string == NULL ||
+        message->attribute.data.size < 1) {
+        chunk_len = 0;
+    } else {
+        chunk_len = zcl_string[0];
+        chunk = (const char *)&zcl_string[1];
+        if (chunk_len > message->attribute.data.size - 1) {
+            chunk_len = MELODY_CHUNK_MAX + 1;
+        }
+    }
+
+    if (xSemaphoreTake(s_melody_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_FAIL;
+    }
+    error = melody_upload_append(&s_melody_upload, chunk, chunk_len);
+    s_melody_last_error = (uint8_t)error;
+    melody_refresh_attr_locked();
+    xSemaphoreGive(s_melody_mutex);
+    if (error != MELODY_ERROR_OK) {
+        ESP_LOGW(TAG, "Melody chunk rejected (error %u)", (unsigned)error);
+        return ESP_ERR_INVALID_ARG;
+    }
     return ESP_OK;
 }
 
@@ -748,10 +861,22 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
                 //light_driver_set_power(light_state);
                 
                 // Play melody when triggered
-                buzzer_play_melody_async();
+                buzzer_play_melody_async(PLAY_SRC_DEFAULT);
             }
-        } else if (message->info.cluster == MELODY_CLUSTER_ID && message->attribute.id == MELODY_ATTR_ID) {
-            ret = melody_attribute_write(message);
+        } else if (message->info.cluster == MELODY_CLUSTER_ID) {
+            switch (message->attribute.id) {
+            case MELODY_ATTR_ID:
+                ret = melody_attribute_write(message);
+                break;
+            case MELODY_CTRL_ATTR_ID:
+                ret = melody_ctrl_attribute_write(message);
+                break;
+            case MELODY_CHUNK_ATTR_ID:
+                ret = melody_chunk_attribute_write(message);
+                break;
+            default:
+                break;
+            }
         }
     }
     return ret;
@@ -768,7 +893,7 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
         const esp_zb_zcl_custom_cluster_command_message_t *command = message;
         if (command != NULL && command->info.dst_endpoint == HA_ESP_LIGHT_ENDPOINT &&
             command->info.cluster == MELODY_CLUSTER_ID && command->info.command.id == MELODY_PLAY_COMMAND_ID) {
-            buzzer_play_melody_async();
+            buzzer_play_melody_async(PLAY_SRC_ACTIVE);
         }
         break;
     }
@@ -825,6 +950,10 @@ static void esp_zb_task(void *pvParameters)
         ESP_ZB_ZCL_ATTR_TYPE_CHAR_STRING, ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE, s_melody_attr));
     ESP_ERROR_CHECK(esp_zb_cluster_add_attr(melody_cluster, MELODY_CLUSTER_ID, MELODY_ERROR_ATTR_ID,
         ESP_ZB_ZCL_ATTR_TYPE_U8, ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &s_melody_last_error));
+    ESP_ERROR_CHECK(esp_zb_cluster_add_attr(melody_cluster, MELODY_CLUSTER_ID, MELODY_CTRL_ATTR_ID,
+        ESP_ZB_ZCL_ATTR_TYPE_U8, ESP_ZB_ZCL_ATTR_ACCESS_WRITE_ONLY, &s_melody_ctrl_value));
+    ESP_ERROR_CHECK(esp_zb_cluster_add_attr(melody_cluster, MELODY_CLUSTER_ID, MELODY_CHUNK_ATTR_ID,
+        ESP_ZB_ZCL_ATTR_TYPE_CHAR_STRING, ESP_ZB_ZCL_ATTR_ACCESS_WRITE_ONLY, s_melody_chunk_attr));
     ESP_ERROR_CHECK(esp_zb_cluster_list_add_custom_cluster(light_cluster_list, melody_cluster,
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
 
@@ -1020,12 +1149,20 @@ void app_main(void)
     s_melody_mutex = xSemaphoreCreateMutex();
     configASSERT(s_melody_mutex != NULL);
 
-    ESP_ERROR_CHECK(melody_parse(DEFAULT_MELODY, strlen(DEFAULT_MELODY), &s_active_melody) == MELODY_ERROR_OK
+    ESP_ERROR_CHECK(melody_parse(DEFAULT_MELODY, strlen(DEFAULT_MELODY), &s_default_melody) == MELODY_ERROR_OK
                     ? ESP_OK : ESP_FAIL);
-    size_t default_melody_len = strlen(DEFAULT_MELODY);
-    memcpy(s_active_melody_text, DEFAULT_MELODY, default_melody_len + 1);
-    s_melody_attr[0] = (uint8_t)default_melody_len;
-    memcpy(&s_melody_attr[1], DEFAULT_MELODY, default_melody_len);
+    if (xSemaphoreTake(s_melody_mutex, portMAX_DELAY) == pdTRUE) {
+        melody_upload_reset(&s_melody_upload);
+        s_active_custom = false;
+        size_t default_melody_len = strlen(DEFAULT_MELODY);
+        s_active_melody_text[0] = '\0';
+        s_melody_attr[0] = (uint8_t)default_melody_len;
+        memcpy(&s_melody_attr[1], DEFAULT_MELODY, default_melody_len);
+        s_melody_last_error = MELODY_ERROR_OK;
+        xSemaphoreGive(s_melody_mutex);
+    } else {
+        ESP_ERROR_CHECK(ESP_FAIL);
+    }
 
     // Display setup (non-critical - continues if display not connected)
     esp_err_t display_err = ssd1306_display_init();

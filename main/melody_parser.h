@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MELODY_MAX_TEXT 120
+#define MELODY_MAX_TEXT 300
 #define MELODY_MAX_STEPS 24
 #define MELODY_MIN_MS 10
 #define MELODY_MAX_MS 2000
@@ -29,6 +29,8 @@ typedef enum {
     MELODY_ERROR_DURATION = 4,
     MELODY_ERROR_NOTE = 5,
     MELODY_ERROR_TOTAL_DURATION = 6,
+    MELODY_ERROR_SEQUENCE = 7,
+    MELODY_ERROR_UNKNOWN_OP = 8,
 } melody_error_t;
 
 /* Parse a bounded ASCII melody. The output changes only when parsing succeeds. */
