@@ -28,7 +28,7 @@ Notes are `A`–`G`, optionally followed by `#`, with octaves 3–6. `R` is a re
 Set a melody:
 
 ```sh
-mosquitto_pub -h 127.0.0.1 \
+docker exec -ti mosquitto mosquitto_pub -h 127.0.0.1 \
   -u '<user>' \
   -P '<password>' \
   -t 'zigbee2mqtt/0xa085e3fffeae3688/set' \
@@ -38,7 +38,7 @@ mosquitto_pub -h 127.0.0.1 \
 Play the configured melody. Send this as a separate command after the set command has completed:
 
 ```sh
-mosquitto_pub -h 127.0.0.1 \
+docker exec -ti mosquitto mosquitto_pub -h 127.0.0.1 \
   -u '<user>' \
   -P '<password>' \
   -t 'zigbee2mqtt/0xa085e3fffeae3688/set' \
