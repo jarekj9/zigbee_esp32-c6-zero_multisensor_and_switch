@@ -1,5 +1,6 @@
 import {onOff} from 'zigbee-herdsman-converters/lib/modernExtend';
 import * as exposes from 'zigbee-herdsman-converters/lib/exposes';
+import fromZigbeeStock from 'zigbee-herdsman-converters/converters/fromZigbee';
 
 const melodyCluster = {
     ID: 0xFC00,
@@ -40,6 +41,24 @@ const fzMelody = {
         if (msg.data.melody !== undefined) result.melody = msg.data.melody;
         if (msg.data.last_error !== undefined) result.melody_error = msg.data.last_error;
         return result;
+    },
+};
+
+// Sensor reports (endpoints 11/12). An external definition replaces Z2M's generic handling,
+// so the stock handlers are reused here and mapped to this device's property names.
+const fzCo2 = {
+    ...fromZigbeeStock.co2,
+    convert: (model, msg, publish, options, meta) => {
+        const result = fromZigbeeStock.co2.convert(model, msg, publish, options, meta);
+        return result ? {co2_11: result.co2} : undefined;
+    },
+};
+
+const fzPm25 = {
+    ...fromZigbeeStock.pm25,
+    convert: (model, msg, publish, options, meta) => {
+        const result = fromZigbeeStock.pm25.convert(model, msg, publish, options, meta);
+        return result ? {pm25_12: result.pm25} : undefined;
     },
 };
 
@@ -120,13 +139,15 @@ export default {
     description: 'ESP32-C6 multi-sensor with configurable buzzer melodies',
     endpoint: () => ({default: 10}),
     extend: [onOff()],
-    fromZigbee: [fzMelody],
+    fromZigbee: [fzMelody, fzCo2, fzPm25],
     toZigbee: [tzMelody, tzMelodyPlay, tzMelodyError],
     exposes: [
         exposes.presets.text('melody', exposes.access.ALL)
             .withDescription('Up to 300 characters, uploaded in sequential chunks of up to 48 characters; empty clears to default'),
         exposes.presets.enum('melody_play', exposes.access.SET, ['PLAY'])
             .withDescription('Play the active melody, or the default if none is set'),
+        exposes.numeric('co2_11', exposes.access.STATE_GET).withUnit('ppm').withDescription('CO2 concentration (endpoint 11)'),
+        exposes.numeric('pm25_12', exposes.access.STATE_GET).withUnit('µg/m³').withDescription('PM2.5 concentration (endpoint 12)'),
         exposes.presets.numeric('melody_error', exposes.access.STATE_GET)
             .withValueMin(0).withValueMax(8)
             .withDescription('Last melody upload error (0 means success; 1-8 describe upload/validation failures)'),

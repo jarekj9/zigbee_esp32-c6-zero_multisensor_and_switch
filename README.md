@@ -73,6 +73,22 @@ data:
 
 An empty `{"melody":""}` clears the custom melody. The exposed `melody_error` is 0 for success; 1–6 indicate length, syntax, token count, duration, note, or total-duration failures; 7 is an upload-sequence error; 8 is an unknown upload operation. Invalid text never replaces the active custom melody. Z2M registers the custom cluster only during device configure. If `melody` or `melody_play` fails with `UNSUPPORTED_CLUSTER` (for example after a Z2M restart or firmware update), reconfigure the device in the Z2M UI, or publish `{"id":"<ieee>"}` to `zigbee2mqtt/bridge/request/device/configure`. If the entities still do not appear, interview the device again.
 
+#### Why the converter also handles sensors
+Z2M uses the external converter instead of its built-in device definition, because the device's fingerprint matches it. Z2M then uses only the handlers in that file, so the sensor clusters need handlers there too:
+
+| Endpoint | Cluster | Z2M property | Handler |
+|---|---|---|---|
+| 11 | `msCO2` (0x040D) | `co2_11` (ppm) | stock `co2` converter, renamed |
+| 12 | `pm25Measurement` (0x042A) | `pm25_12` (µg/m³) | stock `pm25` converter, renamed |
+
+Both handlers reuse Z2M's stock `fromZigbee` converters (`zigbee-herdsman-converters/converters/fromZigbee`) instead of copies. Without them, the sensor reports are received but dropped, and Z2M keeps the last cached value. Symptom: `co2_11` and `pm25_12` stay at old values while the ESP display updates.
+
+Known side effect: `analog_input_12_12` still appears in the state. It is a leftover from endpoint 12 and is harmless.
+
+Without this converter, Z2M reports the device as `Not supported` and exposes no sensor or melody entities. A different coordinator that does not load this converter will not show sensor values unless it has its own definition, for example ZHA in Home Assistant, which reads the standard clusters directly.
+
+Deployment: after editing `data/external_converters/esp32c6_melody.mjs`, copy it to the server and restart Zigbee2MQTT. Check the log for `Loaded external converter 'esp32c6_melody.mjs'`, then reconfigure the device (publish `{"id":"<ieee>"}` to `zigbee2mqtt/bridge/request/device/configure`), because a Z2M restart drops the custom melody cluster. Finally confirm `co2_11` and `pm25_12` change over a few minutes and that a test melody upload returns `melody_error: 0`.
+
 ### Sensors (Periodic Tasks)
 - **CO2 Task:** Reads MHZ19B every 60s, updates attribute, sends ZCL report
 - **PM2.5 Task:** Reads SPS30 every 120s, updates attribute, sends ZCL report
